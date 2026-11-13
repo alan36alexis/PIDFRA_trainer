@@ -1,5 +1,8 @@
 # Control de motor ESP32 con FSM, PID, encoder y CLI
 
+<img width="2048" height="2110" alt="Gemini_Generated_Image_z089a2z089a2z089" src="https://github.com/user-attachments/assets/30b1ff98-4123-4c27-b872-b10540740067" />
+<img width="2048" height="2110" alt="Gemini_Generated_Image_boxrbboxrbboxrbb" src="https://github.com/user-attachments/assets/f8f15f02-1505-432a-bac0-2c80745b917c" />
+
 ## Objetivo
 
 Este proyecto controla un motor DC con puente H y encoder incremental sobre un ESP32 NodeMCU-32S. La estructura actual incluye:
