@@ -50,21 +50,21 @@ Se incorporaran cuatro potenciometros:
 | `KD` | Ganancia derivativa |
 | `SP` | Setpoint |
 
-- [ ] Seleccionar cuatro GPIO ADC validos del ESP32.
-- [ ] Confirmar que los GPIO elegidos no entren en conflicto con UART, PWM,
+- [x] Seleccionar cuatro GPIO ADC validos del ESP32.
+- [x] Confirmar que los GPIO elegidos no entren en conflicto con UART, PWM,
       PCNT, I2C o el switch.
-- [ ] Implementar lectura ADC con el driver recomendado por la version de
+- [x] Implementar lectura ADC con el driver recomendado por la version de
       ESP-IDF usada por el proyecto.
-- [ ] Definir atenuacion, resolucion, filtrado y frecuencia de muestreo ADC.
-- [ ] Convertir cada lectura al rango de control correspondiente.
-- [ ] Aplicar filtrado para evitar cambios bruscos por ruido.
-- [ ] Definir prioridad entre parametros recibidos por CLI y potenciometros.
-- [ ] Agregar una politica de seleccion:
+- [x] Definir atenuacion, resolucion, filtrado y frecuencia de muestreo ADC.
+- [x] Convertir cada lectura al rango de control correspondiente.
+- [x] Aplicar filtrado para evitar cambios bruscos por ruido.
+- [x] Definir prioridad entre parametros recibidos por CLI y potenciometros.
+- [x] Agregar una politica de seleccion:
   - CLI fija parametros manualmente.
   - ADC ajusta parametros en tiempo real.
   - o un comando/estado selecciona la fuente activa.
-- [ ] Generar eventos de actualizacion de parametros hacia la FSM/controlador.
-- [ ] Evitar que el ruido ADC produzca reinicios continuos del PID.
+- [x] Generar eventos de actualizacion de parametros hacia la FSM/controlador.
+- [x] Evitar que el ruido ADC produzca reinicios continuos del PID.
 
 ## 4. Display LCD 20x2 por I2C
 

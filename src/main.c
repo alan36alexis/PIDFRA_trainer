@@ -5,11 +5,15 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "driver/pulse_cnt.h"
 #include "driver/uart.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -33,7 +37,7 @@
 #define DEFAULT_MIN_MOVE_DUTY 170
 #define POSITION_TOLERANCE_COUNTS 8
 #define LOG_QUEUE_LENGTH 16
-#define MOTOR_EVENT_QUEUE_LENGTH 16
+#define MOTOR_EVENT_QUEUE_LENGTH 32
 #define DEFAULT_LOG_PERIOD_MS 500
 
 #define UART_PORT UART_NUM_0
@@ -43,6 +47,56 @@
 #define PWM_RESOLUTION LEDC_TIMER_8_BIT
 #define PWM_MAX_DUTY 255
 #define PCNT_UNIT_USED PCNT_UNIT_0
+
+/* --- Configuracion de pines ADC para los 4 potenciometros (ADC1 input-only) --- */
+#define POT_KP_GPIO GPIO_NUM_36
+#define POT_KI_GPIO GPIO_NUM_39
+#define POT_KD_GPIO GPIO_NUM_34
+#define POT_SP_GPIO GPIO_NUM_35
+
+/* --- Parametros electricos, ADC y filtrado de potenciometros --- */
+#define POT_VOLTAGE_MIN_V 0.0f
+#define POT_VOLTAGE_MAX_V 3.3f
+#define POT_ADC_RAW_MIN 0.0f
+#define POT_ADC_RAW_MAX 4095.0f
+#define POT_ADC_ATTEN ADC_ATTEN_DB_12
+#define POT_ADC_BITWIDTH ADC_BITWIDTH_12
+#define POT_TASK_PERIOD_MS 50
+#define POT_TASK_STACK_SIZE 3072
+#define POT_TASK_PRIORITY 4
+#define POT_MULTISAMPLE_COUNT 8
+#define POT_EMA_ALPHA 0.25f
+#define POT_DEADBAND_NORM 0.01f
+#define POT_ZERO_SNAP_NORM 0.015f
+#define POT_DEFAULT_ENABLED 1
+
+/* --- Rangos de equivalencia empirica: Modo Velocidad (PID Velocidad + SP en RPM) --- */
+#define POT_SPEED_KP_MIN 0.00f
+#define POT_SPEED_KP_MAX 1.00f
+#define POT_SPEED_KI_MIN 0.00f
+#define POT_SPEED_KI_MAX 0.50f
+#define POT_SPEED_KD_MIN 0.000f
+#define POT_SPEED_KD_MAX 0.050f
+#define POT_SPEED_SP_MIN 0.0f
+#define POT_SPEED_SP_MAX 3000.0f
+
+/* --- Rangos de equivalencia empirica: Modo Posicion (PID Posicion + SP en grados) --- */
+#define POT_POS_KP_MIN 0.00f
+#define POT_POS_KP_MAX 0.50f
+#define POT_POS_KI_MIN 0.00f
+#define POT_POS_KI_MAX 0.10f
+#define POT_POS_KD_MIN 0.000f
+#define POT_POS_KD_MAX 0.020f
+#define POT_POS_SP_MIN 0.0f
+#define POT_POS_SP_MAX 360.0f
+
+/* --- Rango de equivalencia empirica: Modo Lazo Abierto (SP en Duty PWM 0..255) --- */
+#define POT_OPEN_SP_MIN 0.0f
+#define POT_OPEN_SP_MAX ((float)PWM_MAX_DUTY)
+
+/* --- Macro de mapeo lineal entre rango normalizado [0..1] (0..3.3V) y [min..max] --- */
+#define POT_MAP_LINEAR(norm, min_val, max_val) \
+  ((min_val) + (norm) * ((max_val) - (min_val)))
 
 typedef struct {
   float kp;
@@ -90,6 +144,10 @@ typedef enum {
   EVENT_DUTY_SETPOINT,
   EVENT_ENCODER_STALL,
   EVENT_CALIBRATE_START,
+  EVENT_POT_KP_UPDATE,
+  EVENT_POT_KI_UPDATE,
+  EVENT_POT_KD_UPDATE,
+  EVENT_POT_SP_UPDATE,
 } motor_event_type_t;
 
 typedef struct {
@@ -98,11 +156,45 @@ typedef struct {
   bool forward;
 } motor_event_t;
 
+typedef enum {
+  POT_CH_KP = 0,
+  POT_CH_KI,
+  POT_CH_KD,
+  POT_CH_SP,
+  POT_CH_COUNT,
+} pot_channel_t;
+
+typedef struct {
+  adc_unit_t unit_id;
+  adc_channel_t channel;
+  adc_oneshot_unit_handle_t unit_handle;
+} pot_adc_channel_t;
+
+typedef struct {
+  float raw_filtered[POT_CH_COUNT];
+  float norm[POT_CH_COUNT];
+  float voltage_v[POT_CH_COUNT];
+  float last_applied_norm[POT_CH_COUNT];
+  float mapped_kp;
+  float mapped_ki;
+  float mapped_kd;
+  float mapped_sp;
+  bool initialized;
+  bool last_mode_valid;
+  bool last_position_mode;
+  bool last_open_loop_mode;
+} pot_state_t;
+
 static QueueHandle_t motor_event_queue;
 static motor_pid_t speed_pid;
 static motor_pid_t position_pid;
 static pcnt_unit_handle_t encoder_unit;
 static QueueHandle_t log_queue;
+static pot_adc_channel_t pot_adc_channels[POT_CH_COUNT];
+static pot_state_t pot_state;
+static volatile bool pot_enabled = (POT_DEFAULT_ENABLED != 0);
+static volatile bool pot_force_sync = true;
+static portMUX_TYPE pot_state_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef enum {
   LOG_EVENT,
@@ -204,7 +296,11 @@ static bool post_motor_event(motor_event_type_t type, float value,
   return xQueueSend(motor_event_queue, &event, 0) == pdTRUE;
 }
 
+static float encoder_counts_per_revolution(void);
+
 static void handle_motor_event(const motor_event_t *event) {
+  bool reset_pids = true;
+
   switch (event->type) {
   case EVENT_STOP:
     target_rpm = 0.0f;
@@ -221,6 +317,7 @@ static void handle_motor_event(const motor_event_t *event) {
     manual_duty = 0;
     running = false;
     motor_state = FSM_IDLE;
+    pot_force_sync = true;
     break;
   case EVENT_MODE_POSITION:
     position_mode = true;
@@ -228,6 +325,7 @@ static void handle_motor_event(const motor_event_t *event) {
     manual_duty = 0;
     running = false;
     motor_state = FSM_IDLE;
+    pot_force_sync = true;
     break;
   case EVENT_MODE_OPEN_LOOP:
     position_mode = false;
@@ -235,6 +333,7 @@ static void handle_motor_event(const motor_event_t *event) {
     running = false;
     manual_duty = 0;
     motor_state = FSM_IDLE;
+    pot_force_sync = true;
     break;
   case EVENT_SPEED_SETPOINT:
     target_rpm = event->value;
@@ -279,10 +378,63 @@ static void handle_motor_event(const motor_event_t *event) {
     }
     stop_motor();
     break;
+  case EVENT_POT_KP_UPDATE:
+    if (position_mode) {
+      position_pid_config.kp = event->value;
+      position_pid.kp = event->value;
+    } else {
+      speed_pid_config.kp = event->value;
+      speed_pid.kp = event->value;
+    }
+    reset_pids = false;
+    break;
+  case EVENT_POT_KI_UPDATE:
+    if (position_mode) {
+      position_pid_config.ki = event->value;
+      position_pid.ki = event->value;
+    } else {
+      speed_pid_config.ki = event->value;
+      speed_pid.ki = event->value;
+    }
+    reset_pids = false;
+    break;
+  case EVENT_POT_KD_UPDATE:
+    if (position_mode) {
+      position_pid_config.kd = event->value;
+      position_pid.kd = event->value;
+    } else {
+      speed_pid_config.kd = event->value;
+      speed_pid.kd = event->value;
+    }
+    reset_pids = false;
+    break;
+  case EVENT_POT_SP_UPDATE:
+    if (encoder_fault) {
+      return;
+    }
+    if (open_loop_mode) {
+      manual_duty = (uint8_t)fminf(fmaxf(event->value, 0.0f), PWM_MAX_DUTY);
+      motor_state = manual_duty > 0 ? FSM_OPEN_LOOP : FSM_IDLE;
+      running = manual_duty > 0;
+    } else if (position_mode) {
+      target_position_counts =
+          event->value * encoder_counts_per_revolution() / 360.0f;
+      pos_in_target = false;
+      motor_state = FSM_POSITION;
+      running = true;
+    } else {
+      target_rpm = event->value;
+      motor_state = target_rpm > 0.0f ? FSM_SPEED : FSM_IDLE;
+      running = target_rpm > 0.0f;
+    }
+    reset_pids = (motor_state == FSM_IDLE);
+    break;
   }
 
-  motor_pid_reset(&speed_pid);
-  motor_pid_reset(&position_pid);
+  if (reset_pids) {
+    motor_pid_reset(&speed_pid);
+    motor_pid_reset(&position_pid);
+  }
   if (motor_state == FSM_IDLE) {
     stop_motor();
   }
@@ -293,8 +445,8 @@ static void print_help(void) {
       "CMD HELP|MODE SPEED/POS/OPEN|SPEED F/R/D <rpm>|POS <cnt>|"
       "ANG <deg>|DUTY F/R/D <0..255>|PULSE F/R <n_cycles> <duty> [freq_hz]|"
       "MINMOVE <0..255>|CAL START/READ/STOP|PID GET|PID SPEED KP/KI/KD <val>|"
-      "PID POS KP/KI/KD <val>|PID DEFAULT|STOP|STATUS|LOG ON/OFF|"
-      "LOG RATE <ms>\r\n");
+      "PID POS KP/KI/KD <val>|PID DEFAULT|POT ON/OFF/GET|STOP|STATUS|"
+      "LOG ON/OFF|LOG RATE <ms>\r\n");
 }
 
 static void apply_speed_pid_config(void) {
@@ -746,6 +898,44 @@ static void process_command(char *command) {
     }
     return;
   }
+  if (strcmp(operation, "POT") == 0 || strcmp(operation, "ADC") == 0 ||
+      strcmp(operation, "POTS") == 0) {
+    char option[16] = {0};
+    if (sscanf(value_text, "%15s", option) == 1) {
+      for (char *p = option; *p != '\0'; p++) {
+        *p = (char)toupper((unsigned char)*p);
+      }
+    }
+    if (strcmp(option, "ON") == 0) {
+      pot_enabled = true;
+      pot_force_sync = true;
+      emit_event("OK POT ON");
+      return;
+    }
+    if (strcmp(option, "OFF") == 0) {
+      pot_enabled = false;
+      emit_event("OK POT OFF");
+      return;
+    }
+    if (option[0] == '\0' || strcmp(option, "GET") == 0 ||
+        strcmp(option, "READ") == 0 || strcmp(option, "STATUS") == 0) {
+      pot_state_t snapshot;
+      taskENTER_CRITICAL(&pot_state_lock);
+      snapshot = pot_state;
+      taskEXIT_CRITICAL(&pot_state_lock);
+      char mode_ch = open_loop_mode ? 'O' : (position_mode ? 'P' : 'V');
+      printf("POT EN=%d MODE=%c KP=%.4f(%.2fV) KI=%.4f(%.2fV) "
+             "KD=%.4f(%.2fV) SP=%.2f(%.2fV)\r\n",
+             pot_enabled ? 1 : 0, mode_ch, snapshot.mapped_kp,
+             snapshot.voltage_v[POT_CH_KP], snapshot.mapped_ki,
+             snapshot.voltage_v[POT_CH_KI], snapshot.mapped_kd,
+             snapshot.voltage_v[POT_CH_KD], snapshot.mapped_sp,
+             snapshot.voltage_v[POT_CH_SP]);
+      return;
+    }
+    emit_event("ERR POT");
+    return;
+  }
   bool speed_command = strcmp(operation, "SPEED") == 0;
   char direction = '\0';
   if (speed_command) {
@@ -982,6 +1172,180 @@ static void control_task(void *arg) {
   }
 }
 
+static void potentiometer_adc_init(void) {
+  static const gpio_num_t pot_gpios[POT_CH_COUNT] = {
+      POT_KP_GPIO,
+      POT_KI_GPIO,
+      POT_KD_GPIO,
+      POT_SP_GPIO,
+  };
+  adc_oneshot_unit_handle_t unit_handles[2] = {NULL, NULL};
+  const adc_oneshot_chan_cfg_t chan_cfg = {
+      .atten = POT_ADC_ATTEN,
+      .bitwidth = POT_ADC_BITWIDTH,
+  };
+
+  for (int i = 0; i < POT_CH_COUNT; i++) {
+    adc_unit_t unit_id = ADC_UNIT_1;
+    adc_channel_t channel = ADC_CHANNEL_0;
+    ESP_ERROR_CHECK(
+        adc_oneshot_io_to_channel(pot_gpios[i], &unit_id, &channel));
+    if (unit_handles[unit_id] == NULL) {
+      const adc_oneshot_unit_init_cfg_t init_cfg = {
+          .unit_id = unit_id,
+          .ulp_mode = ADC_ULP_MODE_DISABLE,
+      };
+      ESP_ERROR_CHECK(
+          adc_oneshot_new_unit(&init_cfg, &unit_handles[unit_id]));
+    }
+    ESP_ERROR_CHECK(
+        adc_oneshot_config_channel(unit_handles[unit_id], channel, &chan_cfg));
+    pot_adc_channels[i].unit_id = unit_id;
+    pot_adc_channels[i].channel = channel;
+    pot_adc_channels[i].unit_handle = unit_handles[unit_id];
+  }
+}
+
+static float normalize_pot_raw(float raw_value) {
+  const float span = POT_ADC_RAW_MAX - POT_ADC_RAW_MIN;
+  float norm = (span > 0.0f) ? ((raw_value - POT_ADC_RAW_MIN) / span) : 0.0f;
+  if (norm < 0.0f) {
+    norm = 0.0f;
+  } else if (norm > 1.0f) {
+    norm = 1.0f;
+  }
+  if (norm < POT_ZERO_SNAP_NORM) {
+    norm = 0.0f;
+  } else if (norm > (1.0f - POT_ZERO_SNAP_NORM)) {
+    norm = 1.0f;
+  }
+  return norm;
+}
+
+static void potentiometer_task(void *arg) {
+  static const motor_event_type_t pot_events[POT_CH_COUNT] = {
+      EVENT_POT_KP_UPDATE,
+      EVENT_POT_KI_UPDATE,
+      EVENT_POT_KD_UPDATE,
+      EVENT_POT_SP_UPDATE,
+  };
+  const TickType_t period_ticks = pdMS_TO_TICKS(POT_TASK_PERIOD_MS);
+  (void)arg;
+
+  while (true) {
+    float raw_filtered[POT_CH_COUNT];
+    float norms[POT_CH_COUNT];
+    float voltages[POT_CH_COUNT];
+    bool was_initialized = false;
+
+    taskENTER_CRITICAL(&pot_state_lock);
+    was_initialized = pot_state.initialized;
+    for (int ch = 0; ch < POT_CH_COUNT; ch++) {
+      raw_filtered[ch] = pot_state.raw_filtered[ch];
+      norms[ch] = pot_state.norm[ch];
+      voltages[ch] = pot_state.voltage_v[ch];
+    }
+    taskEXIT_CRITICAL(&pot_state_lock);
+
+    for (int ch = 0; ch < POT_CH_COUNT; ch++) {
+      int32_t sum = 0;
+      int valid_samples = 0;
+      for (int s = 0; s < POT_MULTISAMPLE_COUNT; s++) {
+        int raw = 0;
+        if (adc_oneshot_read(pot_adc_channels[ch].unit_handle,
+                             pot_adc_channels[ch].channel, &raw) == ESP_OK) {
+          sum += raw;
+          valid_samples++;
+        }
+      }
+      if (valid_samples > 0) {
+        float raw_avg = (float)sum / (float)valid_samples;
+        if (!was_initialized) {
+          raw_filtered[ch] = raw_avg;
+        } else {
+          raw_filtered[ch] += POT_EMA_ALPHA * (raw_avg - raw_filtered[ch]);
+        }
+        norms[ch] = normalize_pot_raw(raw_filtered[ch]);
+        voltages[ch] =
+            POT_MAP_LINEAR(norms[ch], POT_VOLTAGE_MIN_V, POT_VOLTAGE_MAX_V);
+      }
+    }
+
+    bool cur_pos_mode = position_mode;
+    bool cur_open_mode = open_loop_mode;
+    float mapped_kp = cur_pos_mode
+                          ? POT_MAP_LINEAR(norms[POT_CH_KP], POT_POS_KP_MIN,
+                                           POT_POS_KP_MAX)
+                          : POT_MAP_LINEAR(norms[POT_CH_KP], POT_SPEED_KP_MIN,
+                                           POT_SPEED_KP_MAX);
+    float mapped_ki = cur_pos_mode
+                          ? POT_MAP_LINEAR(norms[POT_CH_KI], POT_POS_KI_MIN,
+                                           POT_POS_KI_MAX)
+                          : POT_MAP_LINEAR(norms[POT_CH_KI], POT_SPEED_KI_MIN,
+                                           POT_SPEED_KI_MAX);
+    float mapped_kd = cur_pos_mode
+                          ? POT_MAP_LINEAR(norms[POT_CH_KD], POT_POS_KD_MIN,
+                                           POT_POS_KD_MAX)
+                          : POT_MAP_LINEAR(norms[POT_CH_KD], POT_SPEED_KD_MIN,
+                                           POT_SPEED_KD_MAX);
+    float mapped_sp =
+        cur_open_mode
+            ? POT_MAP_LINEAR(norms[POT_CH_SP], POT_OPEN_SP_MIN, POT_OPEN_SP_MAX)
+            : (cur_pos_mode
+                   ? POT_MAP_LINEAR(norms[POT_CH_SP], POT_POS_SP_MIN,
+                                    POT_POS_SP_MAX)
+                   : POT_MAP_LINEAR(norms[POT_CH_SP], POT_SPEED_SP_MIN,
+                                    POT_SPEED_SP_MAX));
+
+    taskENTER_CRITICAL(&pot_state_lock);
+    for (int ch = 0; ch < POT_CH_COUNT; ch++) {
+      pot_state.raw_filtered[ch] = raw_filtered[ch];
+      pot_state.norm[ch] = norms[ch];
+      pot_state.voltage_v[ch] = voltages[ch];
+    }
+    pot_state.mapped_kp = mapped_kp;
+    pot_state.mapped_ki = mapped_ki;
+    pot_state.mapped_kd = mapped_kd;
+    pot_state.mapped_sp = mapped_sp;
+    pot_state.initialized = true;
+    taskEXIT_CRITICAL(&pot_state_lock);
+
+    bool mode_changed = !pot_state.last_mode_valid ||
+                        (cur_pos_mode != pot_state.last_position_mode) ||
+                        (cur_open_mode != pot_state.last_open_loop_mode);
+    bool force_sync = pot_force_sync || mode_changed;
+
+    if (pot_enabled && !encoder_fault && !pulse_active) {
+      const float mapped_vals[POT_CH_COUNT] = {
+          mapped_kp,
+          mapped_ki,
+          mapped_kd,
+          mapped_sp,
+      };
+      bool all_posted = true;
+      for (int ch = 0; ch < POT_CH_COUNT; ch++) {
+        if (force_sync ||
+            fabsf(norms[ch] - pot_state.last_applied_norm[ch]) >=
+                POT_DEADBAND_NORM) {
+          if (post_motor_event(pot_events[ch], mapped_vals[ch], forward)) {
+            pot_state.last_applied_norm[ch] = norms[ch];
+          } else {
+            all_posted = false;
+          }
+        }
+      }
+      if (all_posted) {
+        pot_force_sync = false;
+        pot_state.last_mode_valid = true;
+        pot_state.last_position_mode = cur_pos_mode;
+        pot_state.last_open_loop_mode = cur_open_mode;
+      }
+    }
+
+    vTaskDelay(period_ticks);
+  }
+}
+
 void app_main(void) {
   const ledc_timer_config_t timer_config = {
       .speed_mode = LEDC_LOW_SPEED_MODE,
@@ -1019,6 +1383,7 @@ void app_main(void) {
   ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
   ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
   encoder_init();
+  potentiometer_adc_init();
   stop_motor();
   apply_speed_pid_config();
   apply_position_pid_config();
@@ -1032,6 +1397,8 @@ void app_main(void) {
   ESP_ERROR_CHECK(motor_event_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
   xTaskCreate(serial_task, "serial_task", 3072, NULL, 5, NULL);
   xTaskCreate(control_task, "control_task", 3072, NULL, 6, NULL);
+  xTaskCreate(potentiometer_task, "pot_task", POT_TASK_STACK_SIZE, NULL,
+              POT_TASK_PRIORITY, NULL);
   log_message_t startup = {.kind = LOG_EVENT};
   snprintf(startup.text, sizeof(startup.text), "READY A=%d B=%d C=%d Q=%d",
            ENCODER_A_GPIO, ENCODER_B_GPIO, ENCODER_CYCLES_PER_CHANNEL,

@@ -47,6 +47,10 @@ La advertencia de tamaño de flash puede aparecer si la placa reporta 2 MB y la 
 | PWM | GPIO21 | EN del puente H |
 | Encoder A | GPIO18 | salida A del encoder |
 | Encoder B | GPIO19 | salida B del encoder |
+| Potenciómetro `KP` | GPIO36 (ADC1_CH0) | cursor potenciómetro lineal 0–3,3 V (`POT_KP_GPIO`) |
+| Potenciómetro `KI` | GPIO39 (ADC1_CH3) | cursor potenciómetro lineal 0–3,3 V (`POT_KI_GPIO`) |
+| Potenciómetro `KD` | GPIO34 (ADC1_CH6) | cursor potenciómetro lineal 0–3,3 V (`POT_KD_GPIO`) |
+| Potenciómetro `SP` | GPIO35 (ADC1_CH7) | cursor potenciómetro lineal 0–3,3 V (`POT_SP_GPIO`) |
 
 Recomendaciones:
 
@@ -121,8 +125,49 @@ Los eventos principales son:
 - `EVENT_ANGLE_SETPOINT`
 - `EVENT_DUTY_SETPOINT`
 - `EVENT_ENCODER_STALL`
+- `EVENT_CALIBRATE_START`
+- `EVENT_POT_KP_UPDATE`
+- `EVENT_POT_KI_UPDATE`
+- `EVENT_POT_KD_UPDATE`
+- `EVENT_POT_SP_UPDATE`
 
-La lógica central es: `serial_task` valida los comandos y publica eventos; `control_task` consume esos eventos, actualiza la FSM y aplica PWM o PID.
+La lógica central es: `serial_task` valida los comandos y publica eventos; `potentiometer_task` muestrea los 4 canales ADC (`adc_oneshot`) con sobremuestreo y filtro EMA, aplica banda muerta (`POT_DEADBAND_NORM`) y publica eventos de actualización; `control_task` consume esos eventos, actualiza la FSM y aplica PWM o PID.
+
+## Potenciómetros ADC (KP, KI, KD, SP)
+
+La lectura de los 4 potenciómetros lineales (0–3,3 V) se ejecuta en una tarea dedicada de FreeRTOS (`potentiometer_task`, cada `POT_TASK_PERIOD_MS`) utilizando el driver `esp_adc/adc_oneshot.h`. Todas las equivalencias a constantes de PID y Setpoint están centralizadas como macros `#define` en [`src/main.c`](src/main.c) para facilitar su calibración empírica:
+
+```c
+/* Pines ADC1 */
+#define POT_KP_GPIO GPIO_NUM_36
+#define POT_KI_GPIO GPIO_NUM_39
+#define POT_KD_GPIO GPIO_NUM_34
+#define POT_SP_GPIO GPIO_NUM_35
+
+/* Modo Velocidad (PID velocidad + SP en RPM) */
+#define POT_SPEED_KP_MIN 0.00f
+#define POT_SPEED_KP_MAX 1.00f
+#define POT_SPEED_KI_MIN 0.00f
+#define POT_SPEED_KI_MAX 0.50f
+#define POT_SPEED_KD_MIN 0.000f
+#define POT_SPEED_KD_MAX 0.050f
+#define POT_SPEED_SP_MIN 0.0f
+#define POT_SPEED_SP_MAX 3000.0f
+
+/* Modo Posición (PID posición + SP en grados) */
+#define POT_POS_KP_MIN 0.00f
+#define POT_POS_KP_MAX 0.50f
+#define POT_POS_KI_MIN 0.00f
+#define POT_POS_KI_MAX 0.10f
+#define POT_POS_KD_MIN 0.000f
+#define POT_POS_KD_MAX 0.020f
+#define POT_POS_SP_MIN 0.0f
+#define POT_POS_SP_MAX 360.0f
+
+/* Modo Lazo Abierto (SP en Duty PWM 0..255) */
+#define POT_OPEN_SP_MIN 0.0f
+#define POT_OPEN_SP_MAX ((float)PWM_MAX_DUTY)
+```
 
 ## CLI y comandos serie
 
@@ -256,6 +301,18 @@ PID DEFAULT
 - `PID SPEED ...` ajusta solo velocidad.
 - `PID POS ...` ajusta solo posición.
 - `PID DEFAULT` recupera la configuración inicial.
+
+### Potenciómetros ADC por serie
+
+```text
+POT ON
+POT OFF
+POT GET
+```
+
+- `POT ON`: habilita la actualización automática de PID y SP desde los potenciómetros.
+- `POT OFF`: deshabilita las actualizaciones desde potenciómetros (permite ajuste exclusivo por CLI sin sobrescritura).
+- `POT GET`: muestra estado (`EN`), modo activo (`V`, `P`, `O`), tensión leída (V) y valor equivalente mapeado de `KP`, `KI`, `KD` y `SP`.
 
 ### Logging y telemetría
 
