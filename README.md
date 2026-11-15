@@ -10,8 +10,9 @@ Este proyecto controla un motor DC con puente H y encoder incremental sobre un E
 - PWM por hardware LEDC para la salida de potencia.
 - Control de sentido mediante GPIOs de dirección.
 - Encoder incremental A/B en cuadratura con PCNT.
-- FSM para estados de velocidad, posición, abierto y falla.
-- Control PID independiente para velocidad y posición.
+- FSM para estados de velocidad, posición, clock, abierto y falla.
+- Control PID independiente para velocidad, posición y modo clock.
+- Modo demostración automática (`CLOCK`) tipo aguja segundera de reloj analógico (60 divisiones por vuelta, avanzando 1 división / 6° cada 1 segundo).
 - Modo abierto (`OPEN`) con duty fijo manual.
 - Umbral mínimo de arranque configurable (`MINMOVE`).
 - Comando de pulso corto con desenergizado final para frenado libre.
@@ -86,12 +87,23 @@ La relación de cuadratura x4 cuenta ambos flancos de A y B, por lo que la resol
 
 ## PID por defecto y umbral mínimo de movimiento
 
-Los PID por defecto están cargados al iniciar el firmware:
+Los PID por defecto están definidos mediante macros en [`src/main.c`](src/main.c) y se cargan al iniciar el firmware (o desde NVS si ya existe una configuración guardada válida):
 
 ```c
-static pid_config_t speed_pid_config = {0.12f, 0.10f, 0.002f};
-static pid_config_t position_pid_config = {0.05f, 0.0f, 0.001f};
+#define DEFAULT_SPEED_KP 0.1200f
+#define DEFAULT_SPEED_KI 0.1000f
+#define DEFAULT_SPEED_KD 0.0020f
+
+#define DEFAULT_POS_KP 0.4000f
+#define DEFAULT_POS_KI 0.2000f
+#define DEFAULT_POS_KD 0.0150f
+
+#define DEFAULT_CLOCK_KP 1.5000f
+#define DEFAULT_CLOCK_KI 1.0000f
+#define DEFAULT_CLOCK_KD 0.0150f
 ```
+
+Es decir, el PID de posición inicia por defecto con `PID P KP=0.4000 KI=0.2000 KD=0.0150` y el PID dedicado del modo `CLOCK` inicia con `PID C KP=1.5000 KI=1.0000 KD=0.0150`.
 
 El umbral mínimo de arranque configurado por defecto es:
 
@@ -111,6 +123,7 @@ Los estados del sistema son:
 | `FSM_IDLE` | `I` | Motor detenido |
 | `FSM_SPEED` | `V` | Control de velocidad |
 | `FSM_POSITION` | `P` | Control de posición |
+| `FSM_CLOCK` | `C` | Demostración automática tipo aguja segundera (60 divisiones, 6°/s) |
 | `FSM_OPEN_LOOP` | `O` | Duty manual, sin lazo cerrado |
 | `FSM_FAULT` | `F` | Falla por bloqueo |
 
@@ -119,6 +132,7 @@ Los eventos principales son:
 - `EVENT_STOP`
 - `EVENT_MODE_SPEED`
 - `EVENT_MODE_POSITION`
+- `EVENT_MODE_CLOCK`
 - `EVENT_MODE_OPEN_LOOP`
 - `EVENT_SPEED_SETPOINT`
 - `EVENT_POSITION_SETPOINT`
@@ -131,7 +145,23 @@ Los eventos principales son:
 - `EVENT_POT_KD_UPDATE`
 - `EVENT_POT_SP_UPDATE`
 
-La lógica central es: `serial_task` valida los comandos y publica eventos; `potentiometer_task` muestrea los 4 canales ADC (`adc_oneshot`) con sobremuestreo y filtro EMA, aplica banda muerta (`POT_DEADBAND_NORM`) y publica eventos de actualización; `control_task` consume esos eventos, actualiza la FSM y aplica PWM o PID.
+La lógica central es: `serial_task` valida los comandos y publica eventos; `potentiometer_task` muestrea los 4 canales ADC (`adc_oneshot`) con sobremuestreo y filtro EMA, aplica banda muerta (`POT_DEADBAND_NORM`) y publica eventos de actualización; `control_task` consume esos eventos, actualiza la FSM y aplica PWM o PID; y `nvs_task` gestiona de forma asíncrona el almacenamiento no volátil en Flash (NVS) sin bloquear el lazo de control.
+
+## Almacenamiento no volátil (NVS) en FreeRTOS
+
+La persistencia de configuración se realiza mediante una tarea dedicada de FreeRTOS (`nvs_task`, prioridad `NVS_TASK_PRIORITY`, cola `nvs_request_queue`) usando la API `nvs_flash` de ESP-IDF. De este modo, las operaciones de borrado/escritura en memoria Flash quedan completamente aisladas de `control_task`.
+
+Parámetros persistidos en la estructura `nvs_stored_config_t` (namespace `pidfra_cfg`, clave `sys_cfg`, con magic number `0x50494446`, versión de esquema y verificación CRC32):
+
+- Constantes PID de velocidad (`speed_pid`: `KP`, `KI`, `KD`).
+- Constantes PID de posición (`position_pid`: `KP`, `KI`, `KD`).
+- Constantes PID de modo clock (`clock_pid`: `KP`, `KI`, `KD`).
+- Umbral mínimo de arranque (`min_move_duty`).
+- Estado de potenciómetros (`pot_enabled`).
+- Estado y período de telemetría (`telemetry_enabled`, `telemetry_period_ms`).
+- Parámetros de calibración del encoder (`encoder_cycles_per_channel`, `encoder_zero_offset_counts`).
+
+Al iniciar (`app_main`), `nvs_storage_init_and_load()` lee y valida el bloque NVS; si no existe o está corrupto, restaura y guarda los valores por defecto (incluyendo `PID P KP=0.4000 KI=0.2000 KD=0.0150`). Además, los cambios realizados por CLI activan un auto-guardado con debounce (`NVS_AUTOSAVE_DEBOUNCE_MS = 2000 ms`) que solo escribe en Flash si la configuración cambió.
 
 ## Potenciómetros ADC (KP, KI, KD, SP)
 
@@ -163,6 +193,14 @@ La lectura de los 4 potenciómetros lineales (0–3,3 V) se ejecuta en una tarea
 #define POT_POS_KD_MAX 0.020f
 #define POT_POS_SP_MIN 0.0f
 #define POT_POS_SP_MAX 360.0f
+
+/* Modo Clock (PID Clock dedicadas; potenciómetros ignorados en CLOCK) */
+#define POT_CLOCK_KP_MIN 0.00f
+#define POT_CLOCK_KP_MAX 0.50f
+#define POT_CLOCK_KI_MIN 0.00f
+#define POT_CLOCK_KI_MAX 0.10f
+#define POT_CLOCK_KD_MIN 0.000f
+#define POT_CLOCK_KD_MAX 0.020f
 
 /* Modo Lazo Abierto (SP en Duty PWM 0..255) */
 #define POT_OPEN_SP_MIN 0.0f
@@ -198,6 +236,7 @@ STAT S=V RUN=1 FLT=0 POS=12.50 REF=1000.00
 MODE SPEED
 MODE POS
 MODE OPEN
+MODE CLOCK
 ```
 
 Alias compatibles:
@@ -206,7 +245,15 @@ Alias compatibles:
 M SPEED
 M POS
 M OPEN
+M CLOCK
+M C
+CLOCK
+CLK
 ```
+
+### Modo demostración automática (`CLOCK`)
+
+Al activar `MODE CLOCK` (o `M CLOCK`, `M C`, `CLOCK`, `CLK`), el sistema toma la posición actual como base y avanza automáticamente 1 división cada 1 segundo sobre una circunferencia de 60 divisiones (6° por segundo, 1 vuelta completa cada 60 segundos), usando el controlador PID dedicado `clock_pid`. En este modo los potenciómetros (`KP`, `KI`, `KD` y `SP`) se ignoran para no sobrescribir las constantes configuradas por CLI ni interferir con la secuencia automática.
 
 ### Duty manual / modo abierto
 
@@ -285,21 +332,27 @@ Esto ejecuta una secuencia de `n_cycles` a un duty dado en la dirección elegida
 PID GET
 PID GET SPEED
 PID GET POS
+PID GET CLOCK
 
 PID SPEED KP 0.12
 PID SPEED KI 0.10
 PID SPEED KD 0.002
 
-PID POS KP 0.05
-PID POS KI 0.0
-PID POS KD 0.001
+PID POS KP 0.4000
+PID POS KI 0.2000
+PID POS KD 0.0150
+
+PID CLOCK KP 1.5000
+PID CLOCK KI 1.0000
+PID CLOCK KD 0.0150
 
 PID DEFAULT
 ```
 
-- `PID GET` devuelve ambos modos.
+- `PID GET` devuelve los tres modos (`V`, `P` y `C`).
 - `PID SPEED ...` ajusta solo velocidad.
 - `PID POS ...` ajusta solo posición.
+- `PID CLOCK ...` (alias `CLK`, `C`) ajusta solo las constantes PID dedicadas del modo `CLOCK`.
 - `PID DEFAULT` recupera la configuración inicial.
 
 ### Potenciómetros ADC por serie
@@ -310,9 +363,28 @@ POT OFF
 POT GET
 ```
 
-- `POT ON`: habilita la actualización automática de PID y SP desde los potenciómetros.
-- `POT OFF`: deshabilita las actualizaciones desde potenciómetros (permite ajuste exclusivo por CLI sin sobrescritura).
-- `POT GET`: muestra estado (`EN`), modo activo (`V`, `P`, `O`), tensión leída (V) y valor equivalente mapeado de `KP`, `KI`, `KD` y `SP`.
+- `POT ON`: habilita la actualización automática de PID y SP desde los potenciómetros (excepto en modo `CLOCK`, donde se ignoran).
+- `POT OFF`: deshabilita las actualizaciones desde potenciómetros (estado por defecto `POT_DEFAULT_ENABLED = 0`; permite ajuste exclusivo por CLI sin sobrescritura).
+- `POT GET`: muestra estado (`EN`), modo activo (`V`, `P`, `C`, `O`), tensión leída (V) y valor equivalente mapeado de `KP`, `KI`, `KD` y `SP`.
+
+### Memoria no volátil (NVS) por serie
+
+```text
+SAVE
+LOAD
+NVS GET
+NVS SAVE
+NVS LOAD
+NVS RESET
+NVS AUTOSAVE ON
+NVS AUTOSAVE OFF
+```
+
+- `SAVE` / `NVS SAVE`: solicita a `nvs_task` guardar inmediatamente la configuración actual en NVS.
+- `LOAD` / `NVS LOAD`: recarga desde NVS la última configuración válida guardada.
+- `NVS RESET`: restaura todos los parámetros persistidos a los valores por defecto y los guarda en NVS.
+- `NVS GET`: muestra el estado de NVS (`READY`, `DIRTY`, `AUTO`, `SAVES`) y los valores actuales de PID, `MINMOVE`, `POT` y `LOG`.
+- `NVS AUTOSAVE ON/OFF`: habilita o deshabilita el auto-guardado con debounce tras cambios por CLI.
 
 ### Logging y telemetría
 
@@ -327,11 +399,13 @@ Los mensajes de telemetría pueden verse como:
 ```text
 TEL V R=1000.0 M=985.2 D=120
 TEL P R=90.00 A=88.74 D=64
+TEL C R=6.00 A=5.95 D=170
 TEL O D=180
 ```
 
 - `V`: velocidad
 - `P`: posición
+- `C`: modo clock
 - `O`: open-loop
 - `R`: referencia
 - `M`: RPM medido

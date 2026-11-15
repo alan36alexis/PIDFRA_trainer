@@ -140,15 +140,15 @@ Se incorporaran cuatro potenciometros:
 
 ## 8. Guardado dinamico en memoria no volatil (NVS)
 
-- [ ] Implementar una funcion de guardado dinamico en memoria no volatil (usando la API NVS de ESP-IDF).
-- [ ] Definir los parametros de configuracion a persistir:
+- [x] Implementar una funcion de guardado dinamico en memoria no volatil (usando la API NVS de ESP-IDF).
+- [x] Definir los parametros de configuracion a persistir:
   - Ganancias PID de velocidad (`Kp`, `Ki`, `Kd`).
   - Ganancias PID de posicion (`Kp`, `Ki`, `Kd`).
   - `min_move_duty` (PWM minimo de arranque).
   - Cuentas por revolucion / calibracion del encoder.
   - Offset de referencia de posicion cero.
-- [ ] Agregar comandos CLI para la gestion de la memoria (por ejemplo `SAVE`, `LOAD`, `NVS RESET`).
-- [ ] Implementar lectura y aplicacion automatica de los parametros guardados durante el arranque (`app_main`).
-- [ ] Validar integridad (magic number, version de esquema o checksum) para restaurar valores por defecto si la memoria no esta inicializada o esta corrupta.
-- [ ] Aislar las operaciones de escritura NVS de la tarea de control en tiempo real (`control_task`) para evitar bloqueos por operaciones de Flash.
+- [x] Agregar comandos CLI para la gestion de la memoria (por ejemplo `SAVE`, `LOAD`, `NVS RESET`).
+- [x] Implementar lectura y aplicacion automatica de los parametros guardados durante el arranque (`app_main`).
+- [x] Validar integridad (magic number, version de esquema o checksum) para restaurar valores por defecto si la memoria no esta inicializada o esta corrupta.
+- [x] Aislar las operaciones de escritura NVS de la tarea de control en tiempo real (`control_task`) para evitar bloqueos por operaciones de Flash.
 
