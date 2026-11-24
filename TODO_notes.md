@@ -66,34 +66,27 @@ Se incorporaran cuatro potenciometros:
 - [x] Generar eventos de actualizacion de parametros hacia la FSM/controlador.
 - [x] Evitar que el ruido ADC produzca reinicios continuos del PID.
 
-## 4. Display LCD 20x2 por I2C
+## 4. Display LCD 8x2 Tinsharp TC802A-01(R) en modo paralelo de 4 bits
 
-- [ ] Seleccionar GPIO SDA y SCL libres.
-- [ ] Confirmar direccion I2C del modulo LCD, normalmente `0x27` o `0x3F`.
-- [ ] Implementar inicializacion del bus I2C y del controlador LCD.
-- [ ] Definir una tarea exclusiva para actualizar el display.
-- [ ] No escribir el display desde `serial_task` ni desde `control_task`.
-- [ ] Mostrar informacion compacta, por ejemplo:
-  - linea 1: modo, estado FSM y setpoint.
-  - linea 2: posicion/RPM, duty o falla.
-- [ ] Limitar la frecuencia de refresco para evitar parpadeos y bloqueo del
-      bus I2C.
-- [ ] Agregar mensajes abreviados para `FAULT`, encoder ausente y motor
-      detenido.
+- [x] Seleccionar GPIO seguros segun `pinout_esp32_pidfra_trainer.md` (`RS=32, E=33, D4=25, D5=26, D6=27, D7=13`, `R/W` fijo a `GND`) y centralizarlos en `include/board_pins.h`.
+- [x] Reemplazar `lib/st7565/` por libreria modular e independiente en `lib/tc802a/` separando HAL (`tc802a_hal.h` / `tc802a_hal_espidf.c`) y driver del controlador (`tc802a_driver.h` / `tc802a_driver.c`).
+- [x] Implementar secuencia de inicializacion HD44780/SPLC780D en 4 bits, buffer local de 8x2 caracteres, `tc802a_flush()` con direccionamiento DDRAM explicito (`0x00`/`0x40`) y rutina de bring-up (bloques `0xFF` + patron `PIDFRA82` / `12345678`).
+- [x] Definir una tarea exclusiva en FreeRTOS (`display_task`, cola `lcd_request_queue`) para ejecutar el bring-up y actualizar las vistas 8x2.
+- [x] No escribir el display desde `serial_task` ni desde `control_task`.
+- [x] Mostrar informacion compacta en 8x2: pantalla principal fija con modo activo en `line0` (`M:SPEED`, `M:POSIC`, `M:CLOCK`, `M:OPEN`) y `SP` en `line1` sin alternar, ademas del menu interactivo (`->MODE, SP, KP, KI, KD`) con timeout de `5 s`.
+- [x] Limitar la frecuencia de refresco (`LCD_REFRESH_PERIOD_MS = 100 ms` / 10 Hz) y adaptar comandos CLI `LCD`.
+- [ ] Validar en hardware real contraste (`V0`), resistencia del backlight y legibilidad del display 8x2.
 
-## 5. Switch de seleccion de modo
+## 5. Encoder rotativo EC11 de interfaz y menu de parametros/modo
 
-- [ ] Seleccionar un GPIO de entrada con pull-up o pull-down definido.
-- [ ] Definir la logica electrica activa del switch.
-- [ ] Implementar antirrebote por software o temporizador.
-- [ ] Convertir el cambio estable del switch en un evento FSM:
-  - velocidad
-  - posicion
-- [ ] Definir prioridad entre el switch y el comando `MODE`.
-- [ ] Evitar cambios de modo repetidos mientras el switch permanezca estable.
-- [ ] Actualizar LCD y CLI cuando el modo cambie.
-- [ ] Definir si el cambio de modo detiene siempre el motor. Recomendacion:
-      detenerlo y reiniciar los PID antes de aceptar una nueva referencia.
+- [x] Configurar `PIN_EC11_CLK` (`GPIO17`), `PIN_EC11_DT` (`GPIO16`) en **PCNT Unidad 1** con `INPUT_PULLUP` y `PIN_EC11_SW` (`GPIO4`) con `INPUT_PULLUP`.
+- [x] Definir logica activa en bajo del pulsador `SW` con antirrebote por software (`EC11_SW_DEBOUNCE_TICKS`).
+- [x] Navegar con el giro del EC11 entre `->MODE`, `->SP`, `->KP`, `->KI`, `->KD` y habilitar su modificacion al presionar `SW`.
+- [x] Al elegir `MODE`, navegar entre los modos con el EC11, aceptar con `SW` (`CONFIRM?`) y confirmar presionando `SW` nuevamente.
+- [x] Al elegir `SP`, `KP`, `KI` o `KD` con `SW`, aplicar inmediatamente las variaciones detectadas en su trimpot (con filtro EMA-IIR y limites `[min, max]`) sin pedir confirmacion con `SW`, reiniciando el timeout de `5 s` en cada cambio y volviendo a la pantalla principal tras `5 s` sin cambios.
+- [x] Aplicar un timeout de `5 s` (`UI_MENU_TIMEOUT_MS = 5000 ms`) en todos los menus para volver automaticamente a la pantalla principal si no hay input.
+- [x] Mantener compatibilidad con comando `MODE` por UART, detener el motor, reiniciar los PID y reiniciar el contador del encoder al cambiar de modo.
+- [ ] Probar en hardware real deteccion de *detents* y respuesta del pulsador `SW`.
 
 ## 6. Cero de posicion al arranque
 
@@ -122,17 +115,17 @@ Se incorporaran cuatro potenciometros:
 
 ## 7. Integracion y validacion
 
-- [ ] Actualizar la tabla de GPIO del `README.md`.
+- [x] Actualizar la tabla de GPIO del `README.md`.
 - [ ] Actualizar estados/eventos y transiciones de la FSM.
-- [ ] Mantener una unica tarea propietaria de UART.
-- [ ] Mantener una unica tarea propietaria del display/I2C.
-- [ ] Definir la sincronizacion de parametros compartidos entre tareas usando
+- [x] Mantener una unica tarea propietaria de UART.
+- [x] Mantener una unica tarea propietaria del display/SPI (`display_task`).
+- [x] Definir la sincronizacion de parametros compartidos entre tareas usando
       eventos, colas o secciones criticas.
 - [ ] Verificar que el control continue ejecutandose aunque el LCD, ADC o CLI
       tengan actividad.
 - [ ] Probar encoder desconectado, motor trabado, ruido ADC y rebote del
       switch.
-- [ ] Ejecutar:
+- [x] Ejecutar:
 
       ```text
       pio run
