@@ -612,7 +612,7 @@ La librería independiente en [`lib/tc802a/`](lib/tc802a/) implementa un driver 
 
 ## Consideraciones finales
 
-- Mantener `serial_task` como único dueño de UART.
+- Mantener `serial_task` como único dueño de la recepción/CLI por UART y `print_task` como única tarea *gatekeeper* propietaria de `printf` (`stdout` / UART TX).
 - Mantener `display_task` como única propietaria de los pines del display LCD TC802A-01(R).
 - Mantener la FSM y la cola de eventos como mecanismo central de control.
 - Actualizar este README cada vez que cambie la estrategia de control, los comandos, los GPIO o las constantes de tuning.
