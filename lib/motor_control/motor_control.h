@@ -57,6 +57,11 @@ typedef struct {
   volatile int64_t safety_unsettled_counts;
   volatile uint32_t safety_settle_ticks;
   volatile float safety_filtered_rpm;
+  int32_t speed_window_counts[SPEED_MEAS_WINDOW_TICKS];
+  size_t speed_window_idx;
+  uint32_t speed_window_samples;
+  int32_t speed_window_sum;
+  float speed_sd_accum;
   volatile float live_measured_rpm;
   volatile uint8_t live_applied_duty;
 

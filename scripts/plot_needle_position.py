@@ -19,14 +19,18 @@ Ejemplos:
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
+import csv
 import math
+import os
 import re
 import signal
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 try:
@@ -75,6 +79,8 @@ DEFAULT_FPS = 50
 DEFAULT_TRAIL = 40
 DEFAULT_COUNTS_PER_REV = 3600
 DEFAULT_XY_WINDOW_S = 15.0
+DEFAULT_XY_MAXLEN = 18000
+EXPORT_WINDOW_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -110,7 +116,7 @@ class TelemetrySnapshot:
     status_text: str = "Esperando datos..."
     last_event: str = ""
     trail: List[float] = field(default_factory=list)
-    xy_history: List[Tuple[float, int, float]] = field(default_factory=list)
+    xy_history: List[Tuple[float, float, int, float]] = field(default_factory=list)
     xy_elapsed_s: float = 0.0
     pid_gains: Dict[str, Tuple[float, float, float]] = field(default_factory=dict)
     pid_revision: int = 0
@@ -183,12 +189,12 @@ class TelemetryTracker:
         self,
         trail_len: int = DEFAULT_TRAIL,
         counts_per_rev: int = DEFAULT_COUNTS_PER_REV,
-        xy_maxlen: int = 3600,
+        xy_maxlen: int = DEFAULT_XY_MAXLEN,
     ) -> None:
         self._lock = threading.Lock()
         self._trail: Deque[float] = collections.deque(maxlen=max(2, trail_len))
         self._sample_times: Deque[float] = collections.deque(maxlen=32)
-        self._xy_history: Deque[Tuple[float, int, float]] = collections.deque(
+        self._xy_history: Deque[Tuple[float, float, int, float]] = collections.deque(
             maxlen=max(64, xy_maxlen)
         )
         self._xy_start_time = time.monotonic()
@@ -204,7 +210,7 @@ class TelemetryTracker:
         self._last_sample_time: Optional[float] = None
         self._last_sample_deg: Optional[float] = None
         self._pid_gains: Dict[str, Tuple[float, float, float]] = {
-            "SPEED": (0.1200, 0.1000, 0.0020),
+            "SPEED": (0.2500, 0.3500, 0.0050),
             "POS": (0.4000, 0.2000, 0.0150),
             "CLOCK": (1.5000, 1.0000, 0.0150),
         }
@@ -292,8 +298,10 @@ class TelemetryTracker:
         degrees: float,
         timestamp: Optional[float] = None,
         target_degrees: Optional[float] = None,
+        wall_time: Optional[float] = None,
     ) -> None:
         now = time.monotonic() if timestamp is None else timestamp
+        wall = time.time() if wall_time is None else wall_time
         with self._lock:
             if counts is not None:
                 self._counts = counts
@@ -304,7 +312,7 @@ class TelemetryTracker:
             if now < self._xy_start_time:
                 self._xy_start_time = now
             self._xy_history.append(
-                (now - self._xy_start_time, self._counts, self._degrees)
+                (now - self._xy_start_time, wall, self._counts, self._degrees)
             )
 
             if target_degrees is not None:
@@ -362,6 +370,71 @@ class TelemetryTracker:
                 serial_log_revision=self._serial_log_revision,
                 log_raw_pos_stream=self._log_raw_pos_stream,
             )
+
+
+def export_last_minute_csv(
+    snap: TelemetrySnapshot,
+    export_dir: str = ".",
+    reference_t_rel: Optional[float] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Exporta hasta el ultimo minuto de muestras a CSV con nombre de rango horario."""
+    if not snap.xy_history:
+        return None, "ERR CSV: sin muestras disponibles para exportar"
+
+    latest_t = snap.xy_history[-1][0]
+    end_t = latest_t if reference_t_rel is None else min(latest_t, reference_t_rel)
+    start_t = end_t - EXPORT_WINDOW_S
+    rows = [row for row in snap.xy_history if start_t <= row[0] <= end_t]
+    if not rows:
+        end_t = latest_t
+        start_t = end_t - EXPORT_WINDOW_S
+        rows = [row for row in snap.xy_history if start_t <= row[0] <= end_t]
+    if not rows:
+        return None, "ERR CSV: sin muestras en la ventana"
+
+    dt_start = datetime.fromtimestamp(rows[0][1])
+    dt_end = datetime.fromtimestamp(rows[-1][1])
+    if dt_start.date() == dt_end.date():
+        filename = (
+            f"{dt_start.strftime('%Y-%m-%d_%H-%M-%S')}_a_"
+            f"{dt_end.strftime('%H-%M-%S')}.csv"
+        )
+    else:
+        filename = (
+            f"{dt_start.strftime('%Y-%m-%d_%H-%M-%S')}_a_"
+            f"{dt_end.strftime('%Y-%m-%d_%H-%M-%S')}.csv"
+        )
+
+    out_dir = export_dir or "."
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "timestamp_iso",
+                "elapsed_s",
+                "counts",
+                "degrees",
+                "degrees_mod_360",
+                "degrees_sine",
+                "seconds_scale",
+            ]
+        )
+        for t_rel, wall, cnt, deg in rows:
+            deg_mod = deg % 360.0
+            writer.writerow(
+                [
+                    datetime.fromtimestamp(wall).isoformat(timespec="milliseconds"),
+                    f"{t_rel:.4f}",
+                    cnt,
+                    f"{deg:.3f}",
+                    f"{deg_mod:.3f}",
+                    f"{180.0 * math.sin(math.radians(deg)):.3f}",
+                    f"{(deg_mod / 6.0):.3f}",
+                ]
+            )
+    return out_path, f"CSV guardado ({len(rows)} muestras): {filename}"
 
 
 class SerialReader:
@@ -604,7 +677,7 @@ class DemoRunner:
                     )
                 self.tracker.record_event("OK PID GET (DEMO)")
             elif upper == "PID DEFAULT":
-                self.tracker.update_pid_gains("SPEED", 0.1200, 0.1000, 0.0020)
+                self.tracker.update_pid_gains("SPEED", 0.2500, 0.3500, 0.0050)
                 self.tracker.update_pid_gains("POS", 0.4000, 0.2000, 0.0150)
                 self.tracker.update_pid_gains("CLOCK", 1.5000, 1.0000, 0.0150)
                 self.tracker.record_event("OK PID DEFAULT (DEMO)")
@@ -980,6 +1053,355 @@ def _xy_bounds(
     return raw_min - pad_y, raw_max + pad_y, raw_min, raw_max
 
 
+def compute_xy_layout(
+    x0: float, y0: float, width: float, height: float
+) -> Tuple[float, float, float, float, float, float, float, float]:
+    """Devuelve (card_x, card_y, card_w, card_h, px, py, pw, ph) del area X-Y."""
+    card_x = x0 + 8.0
+    card_y = y0 + 10.0
+    card_w = max(160.0, width - 18.0)
+    card_h = max(140.0, height - 20.0)
+    pad_l = 66.0
+    pad_r = 22.0
+    pad_t = 62.0
+    pad_b = 46.0
+    px = card_x + pad_l
+    py = card_y + pad_t
+    pw = max(60.0, card_w - pad_l - pad_r)
+    ph = max(60.0, card_h - pad_t - pad_b)
+    return card_x, card_y, card_w, card_h, px, py, pw, ph
+
+
+def compute_xy_plot_rect(
+    total_w: float, total_h: float, show_xy: bool
+) -> Optional[Tuple[float, float, float, float]]:
+    """Devuelve (px, py, pw, ph) de la grafica X-Y en coordenadas del lienzo."""
+    if not show_xy or total_w <= 0.0 or total_h <= 0.0:
+        return None
+    dial_w = max(320.0, total_w * 0.48)
+    xy_w = max(240.0, total_w - dial_w)
+    _, _, _, _, px, py, pw, ph = compute_xy_layout(dial_w, 0.0, xy_w, total_h)
+    return px, py, pw, ph
+
+
+def sample_y_at_time(
+    snap: TelemetrySnapshot, t_query: float, y_mode: str
+) -> Optional[float]:
+    """Interpola el valor Y de la curva registrada en el instante t_query."""
+    hist = snap.xy_history
+    if not hist:
+        return None
+    if t_query <= hist[0][0]:
+        return _transform_xy_value(float(hist[0][2]), hist[0][3], y_mode)
+    if t_query >= hist[-1][0]:
+        return _transform_xy_value(float(hist[-1][2]), hist[-1][3], y_mode)
+
+    lo = 0
+    hi = len(hist) - 1
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if hist[mid][0] <= t_query:
+            lo = mid
+        else:
+            hi = mid
+
+    t0, _, c0, d0 = hist[lo]
+    t1, _, c1, d1 = hist[hi]
+    y0 = _transform_xy_value(float(c0), d0, y_mode)
+    y1 = _transform_xy_value(float(c1), d1, y_mode)
+    if y_mode in (XY_MODE_DEG_360, XY_MODE_DEG_180) and abs(y1 - y0) > 180.0:
+        return y0 if abs(t_query - t0) <= abs(t1 - t_query) else y1
+    dt = t1 - t0
+    if dt <= 1e-9:
+        return y0
+    frac = (t_query - t0) / dt
+    return y0 + frac * (y1 - y0)
+
+
+@dataclass
+class XYInteractiveState:
+    """Estado compartido de pausa, pan, zoom y cursores de medicion X-Y."""
+
+    window_s: float = DEFAULT_XY_WINDOW_S
+    y_mode: str = XY_MODE_COUNTS
+    paused: bool = False
+    follow_live: bool = True
+    view_t_max: float = DEFAULT_XY_WINDOW_S
+    manual_y_range: Optional[Tuple[float, float]] = None
+    cursors_enabled: bool = False
+    snap_to_curve: bool = True
+    cursor1: Optional[Tuple[float, float]] = None
+    cursor2: Optional[Tuple[float, float]] = None
+    next_cursor_idx: int = 1
+    dragging_mode: Optional[str] = None
+    drag_last_x: float = 0.0
+    drag_last_y: float = 0.0
+    last_y_range: Tuple[float, float] = (-180.0, 180.0)
+
+    def effective_t_range(self, snap: TelemetrySnapshot) -> Tuple[float, float]:
+        if not self.paused and self.follow_live:
+            t_max = max(self.window_s, snap.xy_elapsed_s)
+            self.view_t_max = t_max
+        else:
+            t_max = self.view_t_max
+        return t_max - self.window_s, t_max
+
+    def effective_y_range(
+        self, visible_vals: List[float], cur_val: float
+    ) -> Tuple[float, float, float, float]:
+        auto_ymin, auto_ymax, raw_min, raw_max = _xy_bounds(
+            self.y_mode, visible_vals, cur_val
+        )
+        if self.manual_y_range is not None:
+            y_min, y_max = self.manual_y_range
+        else:
+            y_min, y_max = auto_ymin, auto_ymax
+        self.last_y_range = (y_min, y_max)
+        return y_min, y_max, raw_min, raw_max
+
+    def toggle_pause(self, snap: TelemetrySnapshot) -> bool:
+        if not self.paused:
+            if self.follow_live:
+                self.view_t_max = max(self.window_s, snap.xy_elapsed_s)
+            self.paused = True
+            self.follow_live = False
+        else:
+            self.paused = False
+            self.follow_live = True
+            self.view_t_max = max(self.window_s, snap.xy_elapsed_s)
+        return self.paused
+
+    def resume_live(self, snap: TelemetrySnapshot) -> None:
+        self.paused = False
+        self.follow_live = True
+        self.view_t_max = max(self.window_s, snap.xy_elapsed_s)
+
+    def reset_view(
+        self, snap: TelemetrySnapshot, default_window_s: float = DEFAULT_XY_WINDOW_S
+    ) -> None:
+        self.window_s = max(0.5, float(default_window_s))
+        self.manual_y_range = None
+        self.resume_live(snap)
+
+    def set_window_s(self, new_window_s: float, snap: TelemetrySnapshot) -> None:
+        new_w = max(0.5, min(300.0, float(new_window_s)))
+        if self.follow_live and not self.paused:
+            self.view_t_max = max(new_w, snap.xy_elapsed_s)
+        self.window_s = new_w
+
+    def set_y_mode(self, new_mode: str) -> None:
+        if new_mode in XY_Y_MODES and new_mode != self.y_mode:
+            self.y_mode = new_mode
+            self.manual_y_range = None
+            self.cursor1 = None
+            self.cursor2 = None
+            self.next_cursor_idx = 1
+
+    def clear_cursors(self) -> None:
+        self.cursor1 = None
+        self.cursor2 = None
+        self.next_cursor_idx = 1
+
+    def screen_to_data(
+        self,
+        x: float,
+        y: float,
+        rect: Tuple[float, float, float, float],
+        snap: TelemetrySnapshot,
+    ) -> Tuple[float, float]:
+        px, py, pw, ph = rect
+        t_min, t_max = self.effective_t_range(snap)
+        y_min, y_max = self.last_y_range
+        fx = max(0.0, min(1.0, (x - px) / max(1.0, pw)))
+        fy = max(0.0, min(1.0, (py + ph - y) / max(1.0, ph)))
+        return t_min + fx * (t_max - t_min), y_min + fy * (y_max - y_min)
+
+    def place_cursor_at(
+        self,
+        x: float,
+        y: float,
+        rect: Tuple[float, float, float, float],
+        snap: TelemetrySnapshot,
+        cursor_idx: Optional[int] = None,
+    ) -> None:
+        t_val, y_free = self.screen_to_data(x, y, rect, snap)
+        y_val = y_free
+        if self.snap_to_curve:
+            snapped = sample_y_at_time(snap, t_val, self.y_mode)
+            if snapped is not None:
+                y_val = snapped
+        self.cursors_enabled = True
+        idx = self.next_cursor_idx if cursor_idx is None else cursor_idx
+        if cursor_idx is None:
+            self.next_cursor_idx = 2 if idx == 1 else 1
+        if idx == 1:
+            self.cursor1 = (t_val, y_val)
+        else:
+            self.cursor2 = (t_val, y_val)
+
+    def hit_test_cursor(
+        self,
+        x: float,
+        rect: Tuple[float, float, float, float],
+        snap: TelemetrySnapshot,
+        tol_px: float = 9.0,
+    ) -> Optional[str]:
+        if not self.cursors_enabled:
+            return None
+        px, _py, pw, _ph = rect
+        t_min, t_max = self.effective_t_range(snap)
+        span = max(1e-6, t_max - t_min)
+        best: Optional[str] = None
+        best_dist = tol_px
+        for name, cur in (("c1", self.cursor1), ("c2", self.cursor2)):
+            if cur is None:
+                continue
+            cx = px + ((cur[0] - t_min) / span) * pw
+            dist = abs(x - cx)
+            if dist <= best_dist:
+                best_dist = dist
+                best = name
+        return best
+
+    def on_left_down(
+        self,
+        x: float,
+        y: float,
+        total_w: float,
+        total_h: float,
+        show_xy: bool,
+        snap: TelemetrySnapshot,
+    ) -> bool:
+        rect = compute_xy_plot_rect(total_w, total_h, show_xy)
+        if rect is None:
+            return False
+        px, py, pw, ph = rect
+        if not (px <= x <= px + pw and py <= y <= py + ph):
+            return False
+        hit = self.hit_test_cursor(x, rect, snap)
+        if hit is not None:
+            self.dragging_mode = hit
+            self.place_cursor_at(
+                x, y, rect, snap, cursor_idx=(1 if hit == "c1" else 2)
+            )
+            return True
+        if self.follow_live:
+            self.view_t_max = max(self.window_s, snap.xy_elapsed_s)
+        self.follow_live = False
+        self.dragging_mode = "pan"
+        self.drag_last_x = x
+        self.drag_last_y = y
+        return True
+
+    def on_motion(
+        self,
+        x: float,
+        y: float,
+        total_w: float,
+        total_h: float,
+        show_xy: bool,
+        snap: TelemetrySnapshot,
+    ) -> bool:
+        if self.dragging_mode is None:
+            return False
+        rect = compute_xy_plot_rect(total_w, total_h, show_xy)
+        if rect is None:
+            return False
+        px, py, pw, ph = rect
+        if self.dragging_mode in ("c1", "c2"):
+            self.place_cursor_at(
+                x, y, rect, snap, cursor_idx=(1 if self.dragging_mode == "c1" else 2)
+            )
+            return True
+        if self.dragging_mode == "pan":
+            dx = x - self.drag_last_x
+            dy = y - self.drag_last_y
+            self.drag_last_x = x
+            self.drag_last_y = y
+            dt = (dx / max(1.0, pw)) * self.window_s
+            max_bound = max(self.window_s, snap.xy_elapsed_s)
+            min_bound = min(max_bound, self.window_s * 0.25)
+            self.view_t_max = max(min_bound, min(max_bound, self.view_t_max - dt))
+            if self.manual_y_range is not None:
+                y0, y1 = self.manual_y_range
+                dy_val = (dy / max(1.0, ph)) * (y1 - y0)
+                self.manual_y_range = (y0 + dy_val, y1 + dy_val)
+            return True
+        return False
+
+    def on_left_up(self) -> None:
+        self.dragging_mode = None
+
+    def on_right_down(
+        self,
+        x: float,
+        y: float,
+        total_w: float,
+        total_h: float,
+        show_xy: bool,
+        snap: TelemetrySnapshot,
+    ) -> bool:
+        rect = compute_xy_plot_rect(total_w, total_h, show_xy)
+        if rect is None:
+            return False
+        px, py, pw, ph = rect
+        if not (px <= x <= px + pw and py <= y <= py + ph):
+            return False
+        self.place_cursor_at(x, y, rect, snap)
+        return True
+
+    def zoom(
+        self,
+        zoom_in: bool,
+        axis: str = "x",
+        anchor_x: Optional[float] = None,
+        anchor_y: Optional[float] = None,
+        total_w: float = 0.0,
+        total_h: float = 0.0,
+        show_xy: bool = True,
+        snap: Optional[TelemetrySnapshot] = None,
+    ) -> None:
+        factor = 0.8 if zoom_in else 1.25
+        rect = (
+            compute_xy_plot_rect(total_w, total_h, show_xy)
+            if (total_w > 0.0 and total_h > 0.0)
+            else None
+        )
+        if axis in ("x", "xy"):
+            if self.follow_live and snap is not None and not self.paused:
+                self.view_t_max = max(self.window_s, snap.xy_elapsed_s)
+            if rect is not None and anchor_x is not None:
+                fx = max(0.0, min(1.0, (anchor_x - rect[0]) / max(1.0, rect[2])))
+            else:
+                fx = 1.0
+            t_min_old = self.view_t_max - self.window_s
+            t_anchor = t_min_old + fx * self.window_s
+            new_w = max(0.5, min(300.0, self.window_s * factor))
+            new_t_min = t_anchor - fx * new_w
+            self.window_s = new_w
+            self.view_t_max = new_t_min + new_w
+        if axis in ("y", "xy"):
+            y0, y1 = (
+                self.manual_y_range
+                if self.manual_y_range is not None
+                else self.last_y_range
+            )
+            span = max(1e-3, y1 - y0)
+            if rect is not None and anchor_y is not None:
+                fy = max(
+                    0.0,
+                    min(1.0, (rect[1] + rect[3] - anchor_y) / max(1.0, rect[3])),
+                )
+            else:
+                fy = 0.5
+            y_anchor = y0 + fy * span
+            new_span = max(2.0, min(1e7, span * factor))
+            self.manual_y_range = (
+                y_anchor - fy * new_span,
+                y_anchor + (1.0 - fy) * new_span,
+            )
+
+
 def draw_cartesian_xy(
     ctx: "cairo.Context",  # type: ignore[name-defined]
     x0: float,
@@ -989,16 +1411,16 @@ def draw_cartesian_xy(
     snap: TelemetrySnapshot,
     time_window_s: float = DEFAULT_XY_WINDOW_S,
     y_mode: str = XY_MODE_COUNTS,
+    xy_state: Optional[XYInteractiveState] = None,
 ) -> None:
-    """Dibuja la grafica cartesiana X-Y (Tiempo [s] vs Counts o Grados)."""
+    """Dibuja la grafica cartesiana X-Y con pausa, pan, zoom y cursores."""
     ctx.set_source_rgb(0.071, 0.086, 0.122)
     ctx.rectangle(x0, y0, width, height)
     ctx.fill()
 
-    card_x = x0 + 8.0
-    card_y = y0 + 10.0
-    card_w = max(160.0, width - 18.0)
-    card_h = max(140.0, height - 20.0)
+    card_x, card_y, card_w, card_h, px, py, pw, ph = compute_xy_layout(
+        x0, y0, width, height
+    )
     ctx.set_source_rgb(0.095, 0.118, 0.168)
     ctx.rectangle(card_x, card_y, card_w, card_h)
     ctx.fill_preserve()
@@ -1006,34 +1428,41 @@ def draw_cartesian_xy(
     ctx.set_source_rgb(0.24, 0.30, 0.42)
     ctx.stroke()
 
-    pad_l = 66.0
-    pad_r = 22.0
-    pad_t = 54.0
-    pad_b = 46.0
-    px = card_x + pad_l
-    py = card_y + pad_t
-    pw = max(60.0, card_w - pad_l - pad_r)
-    ph = max(60.0, card_h - pad_t - pad_b)
-
-    window_s = max(1.0, float(time_window_s))
-    t_max = max(window_s, snap.xy_elapsed_s)
-    t_min = t_max - window_s
+    if xy_state is not None:
+        y_mode = xy_state.y_mode
+        t_min, t_max = xy_state.effective_t_range(snap)
+        window_s = max(0.5, t_max - t_min)
+    else:
+        window_s = max(0.5, float(time_window_s))
+        t_max = max(window_s, snap.xy_elapsed_s)
+        t_min = t_max - window_s
 
     visible: List[Tuple[float, float]] = []
     prior_pt: Optional[Tuple[float, float]] = None
-    for t_s, cnt, deg in snap.xy_history:
+    next_pt: Optional[Tuple[float, float]] = None
+    for t_s, _wall, cnt, deg in snap.xy_history:
         y_val = _transform_xy_value(float(cnt), deg, y_mode)
         if t_s < t_min:
             prior_pt = (t_s, y_val)
         elif t_s <= t_max:
             visible.append((t_s, y_val))
+        elif next_pt is None:
+            next_pt = (t_s, y_val)
+            break
     if prior_pt is not None:
         visible.insert(0, prior_pt)
+    if next_pt is not None:
+        visible.append(next_pt)
 
     cur_val = _transform_xy_value(float(snap.counts), snap.degrees, y_mode)
-    y_min, y_max, raw_min, raw_max = _xy_bounds(
-        y_mode, [val for _, val in visible], cur_val
-    )
+    if xy_state is not None:
+        y_min, y_max, raw_min, raw_max = xy_state.effective_y_range(
+            [val for _, val in visible], cur_val
+        )
+    else:
+        y_min, y_max, raw_min, raw_max = _xy_bounds(
+            y_mode, [val for _, val in visible], cur_val
+        )
     is_counts = y_mode == XY_MODE_COUNTS
 
     # Fondo interior del area de grafica
@@ -1041,12 +1470,24 @@ def draw_cartesian_xy(
     ctx.rectangle(px, py, pw, ph)
     ctx.fill()
 
-    # Titulo y estadisticas
+    # Titulo y badge de estado (EN VIVO / PAUSA / HISTORIAL)
     ctx.select_font_face("Sans", 0, 1)
-    ctx.set_font_size(13.0)
+    ctx.set_font_size(12.5)
     ctx.set_source_rgb(0.90, 0.94, 0.98)
-    ctx.move_to(card_x + 16.0, card_y + 24.0)
+    ctx.move_to(card_x + 16.0, card_y + 22.0)
     ctx.show_text(f"Gráfica X-Y ({y_mode}) vs Tiempo (s)")
+
+    if xy_state is not None and xy_state.paused:
+        badge_txt, badge_rgb = "[PAUSA]", (0.98, 0.65, 0.20)
+    elif xy_state is not None and not xy_state.follow_live:
+        badge_txt, badge_rgb = "[HISTORIAL]", (0.22, 0.74, 0.97)
+    else:
+        badge_txt, badge_rgb = "[EN VIVO]", (0.20, 0.85, 0.58)
+    ext_b = ctx.text_extents(badge_txt)
+    ctx.set_font_size(11.0)
+    ctx.set_source_rgb(*badge_rgb)
+    ctx.move_to(card_x + card_w - ext_b.width - 16.0, card_y + 22.0)
+    ctx.show_text(badge_txt)
 
     def _fmt_val(val: float) -> str:
         return f"{int(round(val))} cnt" if is_counts else f"{val:.1f}°"
@@ -1056,14 +1497,24 @@ def draw_cartesian_xy(
         sp_cnt = snap.target_degrees * snap.counts_per_rev / 360.0
         sp_val = _transform_xy_value(sp_cnt, snap.target_degrees, y_mode)
         sp_txt = f" | SP: {_fmt_val(sp_val)}"
+    zoom_y_txt = (
+        " | ZoomY" if (xy_state is not None and xy_state.manual_y_range is not None) else ""
+    )
     stats_txt = (
         f"Actual: {_fmt_val(cur_val)} | Min: {_fmt_val(raw_min)} | "
-        f"Max: {_fmt_val(raw_max)} | Ventana: {window_s:.0f}s{sp_txt}"
+        f"Max: {_fmt_val(raw_max)} | Ventana: {window_s:.1f}s{sp_txt}{zoom_y_txt}"
     )
-    ctx.set_font_size(11.0)
+    ctx.set_font_size(10.8)
     ctx.set_source_rgb(0.65, 0.77, 0.90)
-    ctx.move_to(card_x + 16.0, card_y + 42.0)
+    ctx.move_to(card_x + 16.0, card_y + 40.0)
     ctx.show_text(stats_txt)
+
+    ctx.set_font_size(9.8)
+    ctx.set_source_rgb(0.50, 0.60, 0.74)
+    ctx.move_to(card_x + 16.0, card_y + 55.0)
+    ctx.show_text(
+        "Arrastrar izq: retroceder/pan | Rueda: zoom X (Shift+Rueda: zoom Y) | Clic der: cursores C1/C2"
+    )
 
     # Grilla y marcas en X (tiempo) e Y (counts o grados)
     ctx.set_font_size(10.5)
@@ -1077,7 +1528,7 @@ def draw_cartesian_xy(
         ctx.stroke()
 
         y_tick = y_min + frac * (y_max - y_min)
-        y_lbl = f"{int(round(y_tick))}" if is_counts else f"{y_tick:.0f}°"
+        y_lbl = f"{int(round(y_tick))}" if is_counts else f"{y_tick:.1f}°"
         ext = ctx.text_extents(y_lbl)
         ctx.set_source_rgb(0.75, 0.83, 0.92)
         ctx.move_to(px - 8.0 - ext.width - ext.x_bearing, gy + ext.height * 0.4)
@@ -1110,26 +1561,27 @@ def draw_cartesian_xy(
     ctx.move_to(px + pw * 0.5 - ext_ax.width * 0.5, card_y + card_h - 10.0)
     ctx.show_text(lbl_axis_x)
 
-    # Curva recortada dentro del area del grafico
+    # Curva y cursores recortados dentro del area del grafico
     ctx.save()
     ctx.rectangle(px, py, pw, ph)
     ctx.clip()
 
+    y_span = max(1e-6, y_max - y_min)
     if y_min < 0.0 < y_max:
-        zero_y = py + ph - ((0.0 - y_min) / (y_max - y_min)) * ph
+        zero_y = py + ph - ((0.0 - y_min) / y_span) * ph
         ctx.move_to(px, zero_y)
         ctx.line_to(px + pw, zero_y)
         ctx.set_line_width(1.0)
         ctx.set_source_rgba(0.55, 0.66, 0.80, 0.45)
         ctx.stroke()
     else:
-        zero_y = py + ph
+        zero_y = max(py, min(py + ph, py + ph - ((0.0 - y_min) / y_span) * ph))
 
     if snap.target_degrees is not None:
         sp_cnt = snap.target_degrees * snap.counts_per_rev / 360.0
         sp_val = _transform_xy_value(sp_cnt, snap.target_degrees, y_mode)
         if y_min <= sp_val <= y_max:
-            sp_y = py + ph - ((sp_val - y_min) / (y_max - y_min)) * ph
+            sp_y = py + ph - ((sp_val - y_min) / y_span) * ph
             ctx.save()
             ctx.set_dash([6.0, 5.0])
             ctx.move_to(px, sp_y)
@@ -1148,7 +1600,7 @@ def draw_cartesian_xy(
         prev_val: Optional[float] = None
         for t_s, val in visible:
             sx = px + ((t_s - t_min) / window_s) * pw
-            sy = py + ph - ((val - y_min) / (y_max - y_min)) * ph
+            sy = py + ph - ((val - y_min) / y_span) * ph
             if (
                 is_cyclic_jump
                 and prev_val is not None
@@ -1191,10 +1643,92 @@ def draw_cartesian_xy(
     elif len(visible) == 1:
         t_s, val = visible[0]
         sx = px + ((t_s - t_min) / window_s) * pw
-        sy = py + ph - ((val - y_min) / (y_max - y_min)) * ph
+        sy = py + ph - ((val - y_min) / y_span) * ph
         ctx.arc(sx, sy, 4.5, 0, 2.0 * math.pi)
         ctx.set_source_rgb(0.98, 0.36, 0.24)
         ctx.fill()
+
+    # Cursores de medicion C1 / C2
+    if xy_state is not None and xy_state.cursors_enabled:
+        cursor_specs = (
+            ("C1", xy_state.cursor1, (0.98, 0.80, 0.08)),
+            ("C2", xy_state.cursor2, (0.96, 0.45, 0.71)),
+        )
+        for label_c, cur_pt, col_rgb in cursor_specs:
+            if cur_pt is None:
+                continue
+            ct, cy_val = cur_pt
+            cx_px = px + ((ct - t_min) / window_s) * pw
+            cy_px = py + ph - ((cy_val - y_min) / y_span) * ph
+            ctx.save()
+            ctx.set_dash([4.0, 4.0])
+            ctx.set_line_width(1.4)
+            ctx.set_source_rgba(*col_rgb, 0.90)
+            ctx.move_to(cx_px, py)
+            ctx.line_to(cx_px, py + ph)
+            ctx.stroke()
+            ctx.move_to(px, cy_px)
+            ctx.line_to(px + pw, cy_px)
+            ctx.stroke()
+            ctx.restore()
+
+            ctx.arc(cx_px, cy_px, 5.0, 0, 2.0 * math.pi)
+            ctx.set_source_rgb(*col_rgb)
+            ctx.fill_preserve()
+            ctx.set_line_width(1.2)
+            ctx.set_source_rgb(0.08, 0.10, 0.14)
+            ctx.stroke()
+
+            ctx.set_font_size(10.5)
+            ctx.set_source_rgb(*col_rgb)
+            lbl_x = min(px + pw - 22.0, max(px + 4.0, cx_px + 4.0))
+            ctx.move_to(lbl_x, py + 14.0)
+            ctx.show_text(label_c)
+
+        # Panel flotante con mediciones de cursores
+        lines_c: List[Tuple[str, Tuple[float, float, float]]] = []
+        if xy_state.cursor1 is not None:
+            lines_c.append(
+                (
+                    f"C1: t={xy_state.cursor1[0]:.3f}s | Y={_fmt_val(xy_state.cursor1[1])}",
+                    (0.98, 0.80, 0.08),
+                )
+            )
+        if xy_state.cursor2 is not None:
+            lines_c.append(
+                (
+                    f"C2: t={xy_state.cursor2[0]:.3f}s | Y={_fmt_val(xy_state.cursor2[1])}",
+                    (0.96, 0.45, 0.71),
+                )
+            )
+        if xy_state.cursor1 is not None and xy_state.cursor2 is not None:
+            dt_c = xy_state.cursor2[0] - xy_state.cursor1[0]
+            dy_c = xy_state.cursor2[1] - xy_state.cursor1[1]
+            freq_s = f" ({1.0 / abs(dt_c):.2f}Hz)" if abs(dt_c) > 1e-4 else ""
+            dy_s = f"{dy_c:+.1f} cnt" if is_counts else f"{dy_c:+.2f}°"
+            lines_c.append(
+                (
+                    f"Δt={dt_c:+.3f}s{freq_s} | ΔY={dy_s}",
+                    (0.94, 0.97, 1.00),
+                )
+            )
+        if lines_c:
+            ctx.set_font_size(10.5)
+            max_w = max(ctx.text_extents(txt).width for txt, _ in lines_c)
+            box_w = max_w + 18.0
+            box_h = 10.0 + len(lines_c) * 16.0
+            bx = px + 8.0
+            by = py + 8.0
+            ctx.set_source_rgba(0.06, 0.08, 0.13, 0.88)
+            ctx.rectangle(bx, by, box_w, box_h)
+            ctx.fill_preserve()
+            ctx.set_line_width(1.0)
+            ctx.set_source_rgba(0.35, 0.46, 0.64, 0.80)
+            ctx.stroke()
+            for idx_l, (txt_l, col_l) in enumerate(lines_c):
+                ctx.set_source_rgb(*col_l)
+                ctx.move_to(bx + 8.0, by + 17.0 + idx_l * 16.0)
+                ctx.show_text(txt_l)
 
     ctx.restore()
 
@@ -1215,6 +1749,7 @@ def draw_combined_scene(
     show_xy: bool = False,
     xy_window_s: float = DEFAULT_XY_WINDOW_S,
     xy_y_mode: str = XY_MODE_COUNTS,
+    xy_state: Optional[XYInteractiveState] = None,
 ) -> None:
     """Dibuja el dial circular y, si esta desplegada, la grafica X-Y a la derecha."""
     if not show_xy:
@@ -1249,6 +1784,7 @@ def draw_combined_scene(
         snap,
         time_window_s=xy_window_s,
         y_mode=xy_y_mode,
+        xy_state=xy_state,
     )
 
 
@@ -1261,6 +1797,7 @@ def render_dial_rgba(
     show_xy: bool = False,
     xy_window_s: float = DEFAULT_XY_WINDOW_S,
     xy_y_mode: str = XY_MODE_COUNTS,
+    xy_state: Optional[XYInteractiveState] = None,
 ) -> bytes:
     """Renderiza el dial (y grafica X-Y opcional) sobre Cairo y devuelve RGBA."""
     import cairo
@@ -1279,6 +1816,7 @@ def render_dial_rgba(
         show_xy=show_xy,
         xy_window_s=xy_window_s,
         xy_y_mode=xy_y_mode,
+        xy_state=xy_state,
     )
     surface.flush()
     buf = bytearray(surface.get_data())
@@ -1364,9 +1902,11 @@ def run_wx_backend(
     initial_show_config: bool = False,
     initial_show_xy: bool = False,
     initial_show_terminal: bool = False,
+    export_dir: str = ".",
 ) -> int:
     """Ejecuta la interfaz grafica en tiempo real usando wxPython + Cairo."""
     import wx
+    from wx.lib import buttons as wxbuttons
 
     compact_width = 860
     expanded_width = 1520
@@ -1415,8 +1955,27 @@ def run_wx_backend(
         sizer.Add(btn, 0, wx.ALIGN_CENTER_VERTICAL | margin_flags, 4)
         return btn
 
-    add_btn(root_panel, toolbar, "STOP", "STOP")
-    add_btn(root_panel, toolbar, "Cero", "CAL START", tracker.clear_motion_history)
+    stop_btn = wxbuttons.GenButton(root_panel, label="STOP", style=wx.BORDER_NONE)
+    stop_btn.SetBackgroundColour(wx.Colour(220, 38, 38))
+    stop_btn.SetForegroundColour(wx.Colour(255, 255, 255))
+    stop_font = stop_btn.GetFont()
+    stop_font.MakeBold()
+    stop_btn.SetFont(stop_font)
+    stop_btn.SetMinSize((64, 28))
+    stop_btn.Bind(wx.EVT_BUTTON, lambda _evt: send_cmd("STOP"))
+    toolbar.Add(stop_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
+
+    xy_state = XYInteractiveState(
+        window_s=float(state["xy_window_s"]),
+        y_mode=str(state["xy_y_mode"]),
+    )
+
+    def _reset_motion_and_xy() -> None:
+        tracker.clear_motion_history()
+        xy_state.clear_cursors()
+        xy_state.resume_live(tracker.snapshot())
+
+    add_btn(root_panel, toolbar, "Cero", "CAL START", _reset_motion_and_xy)
 
     ang_entry = wx.TextCtrl(root_panel, size=(68, -1), style=wx.TE_PROCESS_ENTER)
     ang_entry.SetHint("deg")
@@ -1437,6 +1996,26 @@ def run_wx_backend(
     ang_btn.Bind(wx.EVT_BUTTON, _send_ang)
     ang_entry.Bind(wx.EVT_TEXT_ENTER, _send_ang)
     toolbar.Add(ang_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+
+    save_plot_btn = wx.Button(root_panel, label="Save Plot")
+
+    def _on_save_plot(_evt: wx.CommandEvent) -> None:
+        snap_now = tracker.snapshot()
+        ref_t = (
+            xy_state.view_t_max
+            if (xy_state.paused or not xy_state.follow_live)
+            else None
+        )
+        try:
+            _path, msg = export_last_minute_csv(
+                snap_now, export_dir=export_dir, reference_t_rel=ref_t
+            )
+            tracker.record_event(msg)
+        except Exception as exc:
+            tracker.record_event(f"ERR CSV: {exc}")
+
+    save_plot_btn.Bind(wx.EVT_BUTTON, _on_save_plot)
+    toolbar.Add(save_plot_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
 
     term_btn = wx.Button(root_panel, label="Terminal Serie")
     toolbar.Add(term_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
@@ -1471,6 +2050,8 @@ def run_wx_backend(
     )
     win_choice.SetSelection(default_win_idx)
     state["xy_window_s"] = XY_WINDOWS_S[default_win_idx]
+    xy_state.window_s = XY_WINDOWS_S[default_win_idx]
+    xy_state.view_t_max = XY_WINDOWS_S[default_win_idx]
     xy_sizer.Add(win_choice, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 8)
 
     xy_sizer.Add(
@@ -1489,6 +2070,8 @@ def run_wx_backend(
         idx = y_mode_choice.GetSelection()
         if 0 <= idx < len(XY_Y_MODES):
             state["xy_y_mode"] = XY_Y_MODES[idx]
+            xy_state.set_y_mode(XY_Y_MODES[idx])
+            canvas.Refresh(False)
 
     def _toggle_counts_sine(_evt: wx.CommandEvent) -> None:
         nxt = (
@@ -1497,20 +2080,98 @@ def run_wx_backend(
             else XY_MODE_COUNTS
         )
         state["xy_y_mode"] = nxt
+        xy_state.set_y_mode(nxt)
         y_mode_choice.SetSelection(XY_Y_MODES.index(nxt))
+        canvas.Refresh(False)
 
     y_mode_choice.Bind(wx.EVT_CHOICE, _on_y_mode_change)
     quick_y_btn.Bind(wx.EVT_BUTTON, _toggle_counts_sine)
     xy_sizer.Add(quick_y_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 8)
 
+    pause_xy_btn = wx.Button(xy_bar, label="⏸ Pausar")
+    xy_sizer.Add(pause_xy_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 6)
+
+    zoom_in_btn = wx.Button(xy_bar, label="Zoom +")
+    zoom_out_btn = wx.Button(xy_bar, label="Zoom -")
+    reset_view_btn = wx.Button(xy_bar, label="Reset Vista")
+    xy_sizer.Add(zoom_in_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 4)
+    xy_sizer.Add(zoom_out_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 4)
+    xy_sizer.Add(reset_view_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 8)
+
+    cursors_chk = wx.CheckBox(xy_bar, label="Cursores")
+    cursors_chk.SetValue(xy_state.cursors_enabled)
+    snap_chk = wx.CheckBox(xy_bar, label="Snap Curva")
+    snap_chk.SetValue(xy_state.snap_to_curve)
+    clear_cur_btn = wx.Button(xy_bar, label="Limpiar Cursores")
+    xy_sizer.Add(cursors_chk, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 6)
+    xy_sizer.Add(snap_chk, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 6)
+    xy_sizer.Add(clear_cur_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 8)
+
     clear_xy_btn = wx.Button(xy_bar, label="Limpiar X-Y")
-    clear_xy_btn.Bind(wx.EVT_BUTTON, lambda _evt: tracker.clear_xy_history())
+
+    def _sync_xy_controls() -> None:
+        is_frozen = xy_state.paused or not xy_state.follow_live
+        pause_xy_btn.SetLabel("▶ En Vivo" if is_frozen else "⏸ Pausar")
+        cursors_chk.SetValue(xy_state.cursors_enabled)
+        snap_chk.SetValue(xy_state.snap_to_curve)
+
+    def _on_pause_xy(_evt: wx.CommandEvent) -> None:
+        xy_state.toggle_pause(tracker.snapshot())
+        _sync_xy_controls()
+        canvas.Refresh(False)
+
+    def _on_zoom_btn(zoom_in: bool) -> None:
+        cw, ch = canvas.GetClientSize()
+        xy_state.zoom(
+            zoom_in,
+            axis="xy",
+            total_w=float(cw),
+            total_h=float(ch),
+            show_xy=bool(state["show_xy"]),
+            snap=tracker.snapshot(),
+        )
+        canvas.Refresh(False)
+
+    def _on_reset_view(_evt: wx.CommandEvent) -> None:
+        xy_state.reset_view(tracker.snapshot(), float(state["xy_window_s"]))
+        _sync_xy_controls()
+        canvas.Refresh(False)
+
+    def _on_clear_xy(_evt: wx.CommandEvent) -> None:
+        tracker.clear_xy_history()
+        xy_state.clear_cursors()
+        xy_state.resume_live(tracker.snapshot())
+        _sync_xy_controls()
+        canvas.Refresh(False)
+
+    pause_xy_btn.Bind(wx.EVT_BUTTON, _on_pause_xy)
+    zoom_in_btn.Bind(wx.EVT_BUTTON, lambda _evt: _on_zoom_btn(True))
+    zoom_out_btn.Bind(wx.EVT_BUTTON, lambda _evt: _on_zoom_btn(False))
+    reset_view_btn.Bind(wx.EVT_BUTTON, _on_reset_view)
+    cursors_chk.Bind(
+        wx.EVT_CHECKBOX,
+        lambda _evt: (
+            setattr(xy_state, "cursors_enabled", cursors_chk.GetValue()),
+            canvas.Refresh(False),
+        ),
+    )
+    snap_chk.Bind(
+        wx.EVT_CHECKBOX,
+        lambda _evt: setattr(xy_state, "snap_to_curve", snap_chk.GetValue()),
+    )
+    clear_cur_btn.Bind(
+        wx.EVT_BUTTON,
+        lambda _evt: (xy_state.clear_cursors(), canvas.Refresh(False)),
+    )
+    clear_xy_btn.Bind(wx.EVT_BUTTON, _on_clear_xy)
     xy_sizer.Add(clear_xy_btn, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT | wx.BOTTOM, 8)
 
     def _on_win_change(_evt: wx.CommandEvent) -> None:
         idx = win_choice.GetSelection()
         if 0 <= idx < len(XY_WINDOWS_S):
             state["xy_window_s"] = XY_WINDOWS_S[idx]
+            xy_state.set_window_s(XY_WINDOWS_S[idx], tracker.snapshot())
+            canvas.Refresh(False)
 
     win_choice.Bind(wx.EVT_CHOICE, _on_win_change)
     root_sizer.Add(xy_bar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
@@ -1791,8 +2452,11 @@ def run_wx_backend(
     xy_toggle.Bind(wx.EVT_TOGGLEBUTTON, _toggle_xy)
 
     last_status = [""]
+    closing = [False]
 
     def _on_paint(_evt: wx.PaintEvent) -> None:
+        if closing[0]:
+            return
         dc = wx.AutoBufferedPaintDC(canvas)
         w, h = canvas.GetClientSize()
         if w <= 0 or h <= 0:
@@ -1805,7 +2469,7 @@ def run_wx_backend(
         if snap.pid_revision != state["pid_rev"]:
             state["pid_rev"] = snap.pid_revision
             _populate_pid_fields()
-        if term_frame.IsShown():
+        if term_frame and term_frame.IsShown():
             _refresh_terminal(snap)
         rgba = render_dial_rgba(
             w,
@@ -1816,23 +2480,115 @@ def run_wx_backend(
             show_xy=bool(state["show_xy"]),
             xy_window_s=float(state["xy_window_s"]),
             xy_y_mode=str(state["xy_y_mode"]),
+            xy_state=xy_state,
         )
         bmp = wx.Bitmap.FromBufferRGBA(w, h, rgba)
         dc.DrawBitmap(bmp, 0, 0, False)
 
+    def _on_canvas_left_down(evt: wx.MouseEvent) -> None:
+        w, h = canvas.GetClientSize()
+        pos = evt.GetPosition()
+        if xy_state.on_left_down(
+            float(pos.x),
+            float(pos.y),
+            float(w),
+            float(h),
+            bool(state["show_xy"]),
+            tracker.snapshot(),
+        ):
+            if not canvas.HasCapture():
+                canvas.CaptureMouse()
+            _sync_xy_controls()
+            canvas.Refresh(False)
+        evt.Skip()
+
+    def _on_canvas_motion(evt: wx.MouseEvent) -> None:
+        if xy_state.dragging_mode is None or not evt.LeftIsDown():
+            evt.Skip()
+            return
+        w, h = canvas.GetClientSize()
+        pos = evt.GetPosition()
+        if xy_state.on_motion(
+            float(pos.x),
+            float(pos.y),
+            float(w),
+            float(h),
+            bool(state["show_xy"]),
+            tracker.snapshot(),
+        ):
+            canvas.Refresh(False)
+        evt.Skip()
+
+    def _on_canvas_left_up(evt: wx.MouseEvent) -> None:
+        if canvas.HasCapture():
+            canvas.ReleaseMouse()
+        xy_state.on_left_up()
+        evt.Skip()
+
+    def _on_canvas_right_down(evt: wx.MouseEvent) -> None:
+        w, h = canvas.GetClientSize()
+        pos = evt.GetPosition()
+        if xy_state.on_right_down(
+            float(pos.x),
+            float(pos.y),
+            float(w),
+            float(h),
+            bool(state["show_xy"]),
+            tracker.snapshot(),
+        ):
+            _sync_xy_controls()
+            canvas.Refresh(False)
+        evt.Skip()
+
+    def _on_canvas_wheel(evt: wx.MouseEvent) -> None:
+        show_xy = bool(state["show_xy"])
+        w, h = canvas.GetClientSize()
+        pos = evt.GetPosition()
+        rect = compute_xy_plot_rect(float(w), float(h), show_xy)
+        if rect is None:
+            evt.Skip()
+            return
+        px, py, pw, ph = rect
+        if not (px <= pos.x <= px + pw and py <= pos.y <= py + ph):
+            evt.Skip()
+            return
+        rot = evt.GetWheelRotation()
+        if rot == 0:
+            evt.Skip()
+            return
+        axis = "y" if evt.ShiftDown() else ("xy" if evt.ControlDown() else "x")
+        xy_state.zoom(
+            rot > 0,
+            axis=axis,
+            anchor_x=float(pos.x),
+            anchor_y=float(pos.y),
+            total_w=float(w),
+            total_h=float(h),
+            show_xy=show_xy,
+            snap=tracker.snapshot(),
+        )
+        canvas.Refresh(False)
+
     canvas.Bind(wx.EVT_PAINT, _on_paint)
     canvas.Bind(wx.EVT_SIZE, lambda evt: (canvas.Refresh(False), evt.Skip()))
+    canvas.Bind(wx.EVT_LEFT_DOWN, _on_canvas_left_down)
+    canvas.Bind(wx.EVT_MOTION, _on_canvas_motion)
+    canvas.Bind(wx.EVT_LEFT_UP, _on_canvas_left_up)
+    canvas.Bind(
+        wx.EVT_MOUSE_CAPTURE_LOST, lambda _evt: xy_state.on_left_up()
+    )
+    canvas.Bind(wx.EVT_RIGHT_DOWN, _on_canvas_right_down)
+    canvas.Bind(wx.EVT_MOUSEWHEEL, _on_canvas_wheel)
 
     timer = wx.Timer(frame)
     interval_ms = max(10, int(1000 / max(1, fps)))
 
     def _on_timer(_evt: wx.TimerEvent) -> None:
-        canvas.Refresh(False)
+        if not closing[0]:
+            canvas.Refresh(False)
 
     frame.Bind(wx.EVT_TIMER, _on_timer, timer)
     timer.Start(interval_ms)
-
-    closing = [False]
 
     def _on_term_close(evt: wx.CloseEvent) -> None:
         if closing[0]:
@@ -1879,6 +2635,7 @@ def run_gtk_backend(
     zero_north: bool,
     xy_window_s: float = DEFAULT_XY_WINDOW_S,
     xy_y_mode: str = XY_MODE_COUNTS,
+    export_dir: str = ".",
 ) -> int:
     """Ejecuta la interfaz grafica en tiempo real usando GTK3 + Cairo."""
     import gi
@@ -1901,6 +2658,28 @@ def run_gtk_backend(
 
     window = Gtk.Window(title="PIDFRA_trainer — Posicion de Aguja, PID, X-Y y Terminal Serie")
     window.set_default_size(compact_width, base_height)
+
+    css_provider = Gtk.CssProvider()
+    css_provider.load_from_data(
+        b"""
+        button.stop-button,
+        button.stop-button:hover {
+            background-image: none;
+            background-color: #dc2626;
+            color: #ffffff;
+            font-weight: bold;
+            border-color: #991b1b;
+        }
+        button.stop-button:active {
+            background-color: #b91c1c;
+        }
+        """
+    )
+    screen = Gdk.Screen.get_default()
+    if screen is not None:
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
     state: Dict[str, object] = {
         "show_xy": False,
@@ -1941,8 +2720,22 @@ def run_gtk_backend(
         btn.connect("clicked", _clicked)
         box.pack_start(btn, False, False, 0)
 
-    add_btn(toolbar, "STOP", "STOP")
-    add_btn(toolbar, "Cero", "CAL START", tracker.clear_motion_history)
+    stop_btn = Gtk.Button(label="STOP")
+    stop_btn.get_style_context().add_class("stop-button")
+    stop_btn.connect("clicked", lambda _w: send_cmd("STOP"))
+    toolbar.pack_start(stop_btn, False, False, 0)
+
+    xy_state = XYInteractiveState(
+        window_s=float(state["xy_window_s"]),
+        y_mode=str(state["xy_y_mode"]),
+    )
+
+    def _reset_motion_and_xy() -> None:
+        tracker.clear_motion_history()
+        xy_state.clear_cursors()
+        xy_state.resume_live(tracker.snapshot())
+
+    add_btn(toolbar, "Cero", "CAL START", _reset_motion_and_xy)
 
     ang_entry = Gtk.Entry()
     ang_entry.set_width_chars(6)
@@ -1964,6 +2757,26 @@ def run_gtk_backend(
     ang_btn.connect("clicked", _send_ang)
     ang_entry.connect("activate", _send_ang)
     toolbar.pack_start(ang_btn, False, False, 0)
+
+    save_plot_btn = Gtk.Button(label="Save Plot")
+
+    def _on_gtk_save_plot(_widget: Gtk.Widget) -> None:
+        snap_now = tracker.snapshot()
+        ref_t = (
+            xy_state.view_t_max
+            if (xy_state.paused or not xy_state.follow_live)
+            else None
+        )
+        try:
+            _path, msg = export_last_minute_csv(
+                snap_now, export_dir=export_dir, reference_t_rel=ref_t
+            )
+            tracker.record_event(msg)
+        except Exception as exc:
+            tracker.record_event(f"ERR CSV: {exc}")
+
+    save_plot_btn.connect("clicked", _on_gtk_save_plot)
+    toolbar.pack_start(save_plot_btn, False, False, 0)
 
     term_btn = Gtk.Button(label="Terminal Serie")
     toolbar.pack_start(term_btn, False, False, 0)
@@ -1988,13 +2801,15 @@ def run_gtk_backend(
     )
     win_combo.set_active(default_win_idx)
     state["xy_window_s"] = XY_WINDOWS_S[default_win_idx]
-    win_combo.connect(
-        "changed",
-        lambda _c: state.__setitem__(
-            "xy_window_s",
-            XY_WINDOWS_S[max(0, win_combo.get_active())],
-        ),
-    )
+    xy_state.window_s = XY_WINDOWS_S[default_win_idx]
+    xy_state.view_t_max = XY_WINDOWS_S[default_win_idx]
+
+    def _on_gtk_win_change(_c: Gtk.ComboBoxText) -> None:
+        new_w = XY_WINDOWS_S[max(0, win_combo.get_active())]
+        state["xy_window_s"] = new_w
+        xy_state.set_window_s(new_w, tracker.snapshot())
+
+    win_combo.connect("changed", _on_gtk_win_change)
     xy_bar.pack_start(win_combo, False, False, 0)
 
     xy_bar.pack_start(Gtk.Label(label="Escala Y:"), False, False, 0)
@@ -2002,13 +2817,13 @@ def run_gtk_backend(
     for ym in XY_Y_MODES:
         y_combo.append_text(ym)
     y_combo.set_active(XY_Y_MODES.index(str(state["xy_y_mode"])))
-    y_combo.connect(
-        "changed",
-        lambda _c: state.__setitem__(
-            "xy_y_mode",
-            XY_Y_MODES[max(0, y_combo.get_active())],
-        ),
-    )
+
+    def _on_gtk_y_change(_c: Gtk.ComboBoxText) -> None:
+        ym = XY_Y_MODES[max(0, y_combo.get_active())]
+        state["xy_y_mode"] = ym
+        xy_state.set_y_mode(ym)
+
+    y_combo.connect("changed", _on_gtk_y_change)
     xy_bar.pack_start(y_combo, False, False, 0)
 
     quick_y_btn = Gtk.Button(label="Counts <-> Grados Sen")
@@ -2020,13 +2835,68 @@ def run_gtk_backend(
             else XY_MODE_COUNTS
         )
         state["xy_y_mode"] = nxt
+        xy_state.set_y_mode(nxt)
         y_combo.set_active(XY_Y_MODES.index(nxt))
 
     quick_y_btn.connect("clicked", _toggle_gtk_counts_sine)
     xy_bar.pack_start(quick_y_btn, False, False, 0)
 
+    pause_xy_btn = Gtk.Button(label="⏸ Pausar")
+    zoom_in_btn = Gtk.Button(label="Zoom +")
+    zoom_out_btn = Gtk.Button(label="Zoom -")
+    reset_view_btn = Gtk.Button(label="Reset Vista")
+    cursors_chk = Gtk.CheckButton(label="Cursores")
+    cursors_chk.set_active(xy_state.cursors_enabled)
+    snap_chk = Gtk.CheckButton(label="Snap Curva")
+    snap_chk.set_active(xy_state.snap_to_curve)
+    clear_cur_btn = Gtk.Button(label="Limpiar Cursores")
     clear_xy_btn = Gtk.Button(label="Limpiar X-Y")
-    clear_xy_btn.connect("clicked", lambda _b: tracker.clear_xy_history())
+
+    def _sync_gtk_xy_controls() -> None:
+        is_frozen = xy_state.paused or not xy_state.follow_live
+        pause_xy_btn.set_label("▶ En Vivo" if is_frozen else "⏸ Pausar")
+        if cursors_chk.get_active() != xy_state.cursors_enabled:
+            cursors_chk.set_active(xy_state.cursors_enabled)
+        if snap_chk.get_active() != xy_state.snap_to_curve:
+            snap_chk.set_active(xy_state.snap_to_curve)
+
+    pause_xy_btn.connect(
+        "clicked",
+        lambda _b: (xy_state.toggle_pause(tracker.snapshot()), _sync_gtk_xy_controls()),
+    )
+    reset_view_btn.connect(
+        "clicked",
+        lambda _b: (
+            xy_state.reset_view(tracker.snapshot(), float(state["xy_window_s"])),
+            _sync_gtk_xy_controls(),
+        ),
+    )
+    cursors_chk.connect(
+        "toggled",
+        lambda _b: setattr(xy_state, "cursors_enabled", cursors_chk.get_active()),
+    )
+    snap_chk.connect(
+        "toggled",
+        lambda _b: setattr(xy_state, "snap_to_curve", snap_chk.get_active()),
+    )
+    clear_cur_btn.connect("clicked", lambda _b: xy_state.clear_cursors())
+    clear_xy_btn.connect(
+        "clicked",
+        lambda _b: (
+            tracker.clear_xy_history(),
+            xy_state.clear_cursors(),
+            xy_state.resume_live(tracker.snapshot()),
+            _sync_gtk_xy_controls(),
+        ),
+    )
+
+    xy_bar.pack_start(pause_xy_btn, False, False, 0)
+    xy_bar.pack_start(zoom_in_btn, False, False, 0)
+    xy_bar.pack_start(zoom_out_btn, False, False, 0)
+    xy_bar.pack_start(reset_view_btn, False, False, 0)
+    xy_bar.pack_start(cursors_chk, False, False, 0)
+    xy_bar.pack_start(snap_chk, False, False, 0)
+    xy_bar.pack_start(clear_cur_btn, False, False, 0)
     xy_bar.pack_start(clear_xy_btn, False, False, 0)
     root_box.pack_start(xy_bar, False, False, 0)
 
@@ -2288,6 +3158,7 @@ def run_gtk_backend(
 
     if has_foreign_cairo:
         drawing_area = Gtk.DrawingArea()
+        event_widget: Gtk.Widget = drawing_area
         root_box.pack_start(drawing_area, True, True, 0)
 
         def _on_draw(widget: Gtk.Widget, ctx: object) -> bool:
@@ -2309,6 +3180,7 @@ def run_gtk_backend(
                 show_xy=bool(state["show_xy"]),
                 xy_window_s=float(state["xy_window_s"]),
                 xy_y_mode=str(state["xy_y_mode"]),
+                xy_state=xy_state,
             )
             return False
 
@@ -2320,7 +3192,10 @@ def run_gtk_backend(
     else:
         image_widget = Gtk.Image()
         image_widget.set_size_request(400, 400)
-        root_box.pack_start(image_widget, True, True, 0)
+        event_box = Gtk.EventBox()
+        event_box.add(image_widget)
+        event_widget = event_box
+        root_box.pack_start(event_box, True, True, 0)
 
         def _refresh_view() -> bool:
             alloc = image_widget.get_allocation()
@@ -2342,12 +3217,128 @@ def run_gtk_backend(
                 show_xy=bool(state["show_xy"]),
                 xy_window_s=float(state["xy_window_s"]),
                 xy_y_mode=str(state["xy_y_mode"]),
+                xy_state=xy_state,
             )
             pixbuf = GdkPixbuf.Pixbuf.new_from_data(
                 rgba, GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4
             )
             image_widget.set_from_pixbuf(pixbuf)
             return True
+
+    def _on_gtk_zoom_btn(zoom_in: bool) -> None:
+        alloc = event_widget.get_allocation()
+        xy_state.zoom(
+            zoom_in,
+            axis="xy",
+            total_w=float(alloc.width),
+            total_h=float(alloc.height),
+            show_xy=bool(state["show_xy"]),
+            snap=tracker.snapshot(),
+        )
+        _refresh_view()
+
+    zoom_in_btn.connect("clicked", lambda _b: _on_gtk_zoom_btn(True))
+    zoom_out_btn.connect("clicked", lambda _b: _on_gtk_zoom_btn(False))
+
+    event_widget.add_events(
+        Gdk.EventMask.BUTTON_PRESS_MASK
+        | Gdk.EventMask.BUTTON_RELEASE_MASK
+        | Gdk.EventMask.POINTER_MOTION_MASK
+        | Gdk.EventMask.SCROLL_MASK
+        | Gdk.EventMask.SMOOTH_SCROLL_MASK
+    )
+
+    def _on_gtk_button_press(widget: Gtk.Widget, evt: Gdk.EventButton) -> bool:
+        alloc = widget.get_allocation()
+        show_xy = bool(state["show_xy"])
+        if evt.button == 1:
+            if xy_state.on_left_down(
+                float(evt.x),
+                float(evt.y),
+                float(alloc.width),
+                float(alloc.height),
+                show_xy,
+                tracker.snapshot(),
+            ):
+                _sync_gtk_xy_controls()
+                _refresh_view()
+                return True
+        elif evt.button == 3:
+            if xy_state.on_right_down(
+                float(evt.x),
+                float(evt.y),
+                float(alloc.width),
+                float(alloc.height),
+                show_xy,
+                tracker.snapshot(),
+            ):
+                _sync_gtk_xy_controls()
+                _refresh_view()
+                return True
+        return False
+
+    def _on_gtk_motion(widget: Gtk.Widget, evt: Gdk.EventMotion) -> bool:
+        if xy_state.dragging_mode is None:
+            return False
+        alloc = widget.get_allocation()
+        if xy_state.on_motion(
+            float(evt.x),
+            float(evt.y),
+            float(alloc.width),
+            float(alloc.height),
+            bool(state["show_xy"]),
+            tracker.snapshot(),
+        ):
+            _refresh_view()
+            return True
+        return False
+
+    def _on_gtk_button_release(_widget: Gtk.Widget, _evt: Gdk.EventButton) -> bool:
+        if xy_state.dragging_mode is not None:
+            xy_state.on_left_up()
+            return True
+        return False
+
+    def _on_gtk_scroll(widget: Gtk.Widget, evt: Gdk.EventScroll) -> bool:
+        show_xy = bool(state["show_xy"])
+        alloc = widget.get_allocation()
+        rect = compute_xy_plot_rect(float(alloc.width), float(alloc.height), show_xy)
+        if rect is None:
+            return False
+        px, py, pw, ph = rect
+        if not (px <= evt.x <= px + pw and py <= evt.y <= py + ph):
+            return False
+        zoom_in: Optional[bool] = None
+        if evt.direction == Gdk.ScrollDirection.UP:
+            zoom_in = True
+        elif evt.direction == Gdk.ScrollDirection.DOWN:
+            zoom_in = False
+        elif evt.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = evt.get_scroll_deltas()
+            if ok and abs(dy) > 1e-6:
+                zoom_in = dy < 0.0
+        if zoom_in is None:
+            return False
+        shift = bool(evt.state & Gdk.ModifierType.SHIFT_MASK)
+        ctrl = bool(evt.state & Gdk.ModifierType.CONTROL_MASK)
+        axis = "y" if shift else ("xy" if ctrl else "x")
+        xy_state.zoom(
+            zoom_in,
+            axis=axis,
+            anchor_x=float(evt.x),
+            anchor_y=float(evt.y),
+            total_w=float(alloc.width),
+            total_h=float(alloc.height),
+            show_xy=show_xy,
+            snap=tracker.snapshot(),
+        )
+        _refresh_view()
+        return True
+
+    event_widget.connect("button-press-event", _on_gtk_button_press)
+    event_widget.connect("motion-notify-event", _on_gtk_motion)
+    event_widget.connect("button-release-event", _on_gtk_button_release)
+    event_widget.connect("scroll-event", _on_gtk_scroll)
 
     interval_ms = max(10, int(1000 / max(1, fps)))
     timer_id = GLib.timeout_add(interval_ms, _refresh_view)
@@ -2480,10 +3471,17 @@ def run_self_test() -> int:
     tracker.update_pid_gains("POS", 0.45, 0.21, 0.015)
     tracker.append_serial_log("TX > PID GET")
     tracker.append_serial_log("RX < PID P KP=0.4500 KI=0.2100 KD=0.0150")
-    tracker.update_position(0, 0.0, timestamp=1.0)
-    tracker.update_position(908, 90.80, timestamp=1.2, target_degrees=90.0)
-    tracker.update_position(1800, 180.0, timestamp=1.4, target_degrees=90.0)
-    tracker.update_position(2700, 270.0, timestamp=1.6, target_degrees=90.0)
+    base_wall = 1764200000.0
+    tracker.update_position(0, 0.0, timestamp=1.0, wall_time=base_wall)
+    tracker.update_position(
+        908, 90.80, timestamp=1.2, target_degrees=90.0, wall_time=base_wall + 0.2
+    )
+    tracker.update_position(
+        1800, 180.0, timestamp=1.4, target_degrees=90.0, wall_time=base_wall + 0.4
+    )
+    tracker.update_position(
+        2700, 270.0, timestamp=1.6, target_degrees=90.0, wall_time=base_wall + 0.6
+    )
     snap = tracker.snapshot()
     assert snap.counts == 2700
     assert abs(snap.angle_mod_360 - 270.0) < 1e-6
@@ -2496,7 +3494,26 @@ def run_self_test() -> int:
     assert abs(_transform_xy_value(2700, 270.0, XY_MODE_DEG_SINE) + 180.0) < 1e-6
     assert abs(_transform_xy_value(3700, 370.0, XY_MODE_DEG_360) - 10.0) < 1e-6
 
+    y_interp = sample_y_at_time(snap, 0.5, XY_MODE_DEG_ACCUM)
+    assert y_interp is not None and abs(y_interp - 225.0) < 1e-6
+
+    xy_state = XYInteractiveState(window_s=15.0, y_mode=XY_MODE_DEG_SINE)
+    xy_state.toggle_pause(snap)
+    assert xy_state.paused and not xy_state.follow_live
+    rect = compute_xy_plot_rect(1280.0, 680.0, True)
+    assert rect is not None
+    assert xy_state.on_right_down(
+        rect[0] + rect[2] * 0.25, rect[1] + rect[3] * 0.5, 1280.0, 680.0, True, snap
+    )
+    assert xy_state.on_right_down(
+        rect[0] + rect[2] * 0.75, rect[1] + rect[3] * 0.5, 1280.0, 680.0, True, snap
+    )
+    assert xy_state.cursor1 is not None and xy_state.cursor2 is not None
+    xy_state.zoom(True, axis="x", total_w=1280.0, total_h=680.0, show_xy=True, snap=snap)
+    assert xy_state.window_s < 15.0
+
     for y_mode in (XY_MODE_COUNTS, XY_MODE_DEG_SINE, XY_MODE_DEG_360):
+        xy_state.set_y_mode(y_mode)
         rgba = render_dial_rgba(
             1280,
             680,
@@ -2506,9 +3523,26 @@ def run_self_test() -> int:
             show_xy=True,
             xy_window_s=15.0,
             xy_y_mode=y_mode,
+            xy_state=xy_state,
         )
         assert len(rgba) == 1280 * 680 * 4
         assert any(b != 0 for b in rgba[:4096]), f"Buffer vacio en modo {y_mode}"
+
+    import tempfile
+
+    csv_tracker = TelemetryTracker(trail_len=10, counts_per_rev=3600)
+    csv_tracker.update_position(100, 10.0, timestamp=10.0, wall_time=base_wall + 10.0)
+    csv_tracker.update_position(200, 20.0, timestamp=50.0, wall_time=base_wall + 50.0)
+    csv_tracker.update_position(300, 30.0, timestamp=80.0, wall_time=base_wall + 80.0)
+    csv_snap = csv_tracker.snapshot()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        csv_path, csv_msg = export_last_minute_csv(csv_snap, export_dir=tmpdir)
+        assert os.path.isfile(csv_path)
+        assert "_a_" in os.path.basename(csv_path) and csv_path.endswith(".csv")
+        assert "2 muestras" in csv_msg, f"Se esperaban 2 muestras del ultimo minuto: {csv_msg}"
+        with open(csv_path, encoding="utf-8") as fh:
+            lines = fh.read().strip().splitlines()
+        assert len(lines) == 3  # header + t=50 y t=80 (t=10 fuera de ventana 60s)
 
     if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and (
         select_backend("auto") == "wx"
@@ -2530,7 +3564,7 @@ def run_self_test() -> int:
         assert rc == 0
 
     print(
-        "SELF-TEST OK: parser P/PID, 3 escalas, X-Y en grados senoidales y Terminal Serie verificados."
+        "SELF-TEST OK: parser P/PID, 3 escalas, X-Y interactivo (pan/zoom/cursores), export CSV 1 min y Terminal Serie verificados."
     )
     return 0
 
@@ -2639,6 +3673,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Escala Y inicial de la grafica X-Y: counts, sine (180*sin), deg360, deg180 o accum.",
     )
     parser.add_argument(
+        "--export-dir",
+        default=".",
+        help="Directorio donde 'Save Plot' guarda los CSV del ultimo minuto (por defecto: '.').",
+    )
+    parser.add_argument(
         "--demo",
         action="store_true",
         help="Ejecuta una simulacion sin hardware serie conectado.",
@@ -2705,6 +3744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 zero_north=zero_north,
                 xy_window_s=args.xy_window,
                 xy_y_mode=xy_y_mode,
+                export_dir=args.export_dir,
             )
         if backend == "gtk":
             return run_gtk_backend(
@@ -2716,6 +3756,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 zero_north=zero_north,
                 xy_window_s=args.xy_window,
                 xy_y_mode=xy_y_mode,
+                export_dir=args.export_dir,
             )
         return run_matplotlib_backend(
             tracker=tracker,

@@ -107,10 +107,12 @@ void lcd_ui_format_sp_line(char *buf, size_t buf_size,
     }
   } else {
     float rpm_clamped = fmaxf(snap->target_rpm, 0.0f);
-    if (rpm_clamped >= 10000.0f) {
+    if (rpm_clamped >= 9999.5f) {
       snprintf(buf, buf_size, "SP:%5.0f", (double)rpm_clamped);
-    } else {
+    } else if (rpm_clamped >= 99.95f) {
       snprintf(buf, buf_size, "SP:%4.0fr", (double)rpm_clamped);
+    } else {
+      snprintf(buf, buf_size, "SP:%4.1fr", (double)rpm_clamped);
     }
   }
 }

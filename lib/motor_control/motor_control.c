@@ -65,6 +65,14 @@ static void pulse_diag_cb(const char *tag, uint32_t elapsed_ms,
   }
 }
 
+static void reset_speed_estimator(app_context_t *app) {
+  memset(app->speed_window_counts, 0, sizeof(app->speed_window_counts));
+  app->speed_window_idx = 0U;
+  app->speed_window_samples = 0U;
+  app->speed_window_sum = 0;
+  app->speed_sd_accum = 0.0f;
+}
+
 static void reset_safety_search_tracker(app_context_t *app) {
   app->safety_unsettled_counts = 0;
   app->safety_settle_ticks = 0;
@@ -76,6 +84,7 @@ static void reset_encoder_state_locked(app_context_t *app) {
   app->target_position_counts = 0.0f;
   app->clock_base_counts = 0;
   app->clock_step_count = 0;
+  reset_speed_estimator(app);
 }
 
 static void latch_encoder_fault(app_context_t *app) {
@@ -84,6 +93,7 @@ static void latch_encoder_fault(app_context_t *app) {
   app->motor_fault_reason = FAULT_ENCODER_STALL;
   app->motor_state = FSM_FAULT;
   app->running = false;
+  reset_speed_estimator(app);
   reset_safety_search_tracker(app);
   motor_pid_reset(&app->speed_pid);
   motor_pid_reset(&app->position_pid);
@@ -106,6 +116,7 @@ static void latch_setpoint_revs_fault(app_context_t *app, float traveled_revs) {
   app->motor_state = FSM_FAULT;
   app->running = false;
   app->pos_in_target = false;
+  reset_speed_estimator(app);
   reset_safety_search_tracker(app);
   motor_pid_reset(&app->speed_pid);
   motor_pid_reset(&app->position_pid);
@@ -368,6 +379,7 @@ void motor_control_handle_event(app_context_t *app,
     app->clock_elapsed_ms = 0;
     app->pos_in_target = false;
     app->motor_state = FSM_IDLE;
+    reset_speed_estimator(app);
     reset_safety_search_tracker(app);
     break;
   case EVENT_MODE_SPEED:
@@ -433,7 +445,8 @@ void motor_control_handle_event(app_context_t *app,
     need_clear_hw_encoder = true;
     reset_safety_search_tracker(app);
     break;
-  case EVENT_SPEED_SETPOINT:
+  case EVENT_SPEED_SETPOINT: {
+    bool direction_changed = (app->forward != event->forward);
     if (!was_speed_mode) {
       reset_encoder_state_locked(app);
       need_clear_hw_encoder = true;
@@ -446,12 +459,15 @@ void motor_control_handle_event(app_context_t *app,
     app->clock_elapsed_ms = 0;
     app->motor_state = app->target_rpm > 0.0f ? FSM_SPEED : FSM_IDLE;
     app->running = app->target_rpm > 0.0f;
-    if (!was_speed_mode || prev_state == FSM_IDLE || !was_running) {
+    if (!was_speed_mode || prev_state == FSM_IDLE || !was_running ||
+        direction_changed) {
+      reset_speed_estimator(app);
       reset_safety_search_tracker(app);
     } else {
       app->safety_settle_ticks = 0;
     }
     break;
+  }
   case EVENT_POSITION_SETPOINT:
   case EVENT_ANGLE_SETPOINT:
     if (!was_position_mode) {
@@ -544,6 +560,9 @@ void motor_control_handle_event(app_context_t *app,
       app->motor_state = app->target_rpm > 0.0f ? FSM_SPEED : FSM_IDLE;
       app->running = app->target_rpm > 0.0f;
     }
+    if (app->motor_state == FSM_IDLE) {
+      reset_speed_estimator(app);
+    }
     reset_pids = (app->motor_state == FSM_IDLE);
     break;
   case EVENT_ENCODER_STALL:
@@ -555,6 +574,7 @@ void motor_control_handle_event(app_context_t *app,
   }
 
   if (reset_pids) {
+    app->speed_sd_accum = 0.0f;
     motor_pid_reset(&app->speed_pid);
     motor_pid_reset(&app->position_pid);
     motor_pid_reset(&app->clock_pid);
@@ -578,6 +598,16 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
                         uint32_t *pos_log_elapsed_ms) {
   taskENTER_CRITICAL(&app->config_state_lock);
   app->encoder_position_counts += counts;
+  app->speed_window_sum -= app->speed_window_counts[app->speed_window_idx];
+  app->speed_window_counts[app->speed_window_idx] = counts;
+  app->speed_window_sum += counts;
+  app->speed_window_idx =
+      (app->speed_window_idx + 1U) % SPEED_MEAS_WINDOW_TICKS;
+  if (app->speed_window_samples < SPEED_MEAS_WINDOW_TICKS) {
+    app->speed_window_samples++;
+  }
+  int32_t cur_window_sum = app->speed_window_sum;
+  uint32_t cur_window_samples = app->speed_window_samples;
   int64_t cur_pos_counts = app->encoder_position_counts;
   uint32_t cycles_per_ch = app->encoder_cycles_per_channel;
   motor_state_t cur_state = app->motor_state;
@@ -589,9 +619,16 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
   taskEXIT_CRITICAL(&app->config_state_lock);
 
   float counts_per_revolution = motor_hw_counts_per_revolution(cycles_per_ch);
-  float measured_rpm =
-      ((float)abs(counts) * 60.0f) / (counts_per_revolution * sample_time);
+  float window_time = (float)cur_window_samples * sample_time;
+  int32_t abs_window_counts =
+      (cur_window_sum >= 0) ? cur_window_sum : -cur_window_sum;
+  float measured_cps =
+      (window_time > 0.0f) ? ((float)abs_window_counts / window_time) : 0.0f;
+  float measured_rpm = (counts_per_revolution > 0.0f)
+                           ? ((measured_cps * 60.0f) / counts_per_revolution)
+                           : 0.0f;
   uint8_t applied_duty = 0;
+  uint8_t reported_duty = 0;
   bool movement_expected = false;
 
   if (cur_state == FSM_SPEED || cur_state == FSM_POSITION ||
@@ -600,6 +637,7 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
       applied_duty = run_position_pid_step(
           app, &app->position_pid, cur_target_pos, sample_time,
           cur_pos_out_log, false, &movement_expected);
+      reported_duty = applied_duty;
     } else if (cur_state == FSM_CLOCK) {
       taskENTER_CRITICAL(&app->config_state_lock);
       app->clock_elapsed_ms += CONTROL_PERIOD_MS;
@@ -623,31 +661,54 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
       applied_duty = run_position_pid_step(
           app, &app->clock_pid, cur_target_pos, sample_time, false, true,
           &movement_expected);
+      reported_duty = applied_duty;
     } else if (cur_state == FSM_SPEED) {
-      float duty = 0.0f;
+      float speed_cmd_duty = 0.0f;
       uint8_t min_duty = 0;
       taskENTER_CRITICAL(&app->config_state_lock);
       cur_target_rpm = app->target_rpm;
       cur_forward = app->forward;
       min_duty = app->min_move_duty;
-      duty = motor_pid_update(&app->speed_pid, cur_target_rpm, measured_rpm,
-                              sample_time);
+      if (cur_target_rpm > 0.0f && counts_per_revolution > 0.0f) {
+        float target_cps = (cur_target_rpm * counts_per_revolution) / 60.0f;
+        speed_cmd_duty = motor_pid_update(&app->speed_pid, target_cps,
+                                          measured_cps, sample_time);
+      }
       taskEXIT_CRITICAL(&app->config_state_lock);
 
-      float abs_duty = fabsf(duty);
-      if (fabsf(cur_target_rpm) > 0.0f && abs_duty > 0.0f) {
-        if (abs_duty < (float)min_duty) {
-          abs_duty = (float)min_duty;
+      if (cur_target_rpm > 0.0f && counts_per_revolution > 0.0f) {
+        if (speed_cmd_duty < 0.0f) {
+          speed_cmd_duty = 0.0f;
+        } else if (speed_cmd_duty > (float)PWM_MAX_DUTY) {
+          speed_cmd_duty = (float)PWM_MAX_DUTY;
         }
-        applied_duty = (uint8_t)fminf(abs_duty, PWM_MAX_DUTY);
-        movement_expected = applied_duty >= STALL_MIN_DUTY;
+        reported_duty = (uint8_t)lroundf(speed_cmd_duty);
+        if (speed_cmd_duty >= (float)min_duty) {
+          applied_duty = reported_duty;
+          app->speed_sd_accum = 0.0f;
+        } else if (speed_cmd_duty > 0.0f) {
+          app->speed_sd_accum += speed_cmd_duty;
+          if (app->speed_sd_accum >= (float)min_duty) {
+            applied_duty = min_duty;
+            app->speed_sd_accum -= (float)min_duty;
+          } else {
+            applied_duty = 0;
+          }
+        } else {
+          applied_duty = 0;
+          app->speed_sd_accum = 0.0f;
+        }
+        movement_expected = speed_cmd_duty >= (float)STALL_MIN_DUTY;
       } else {
         applied_duty = 0;
+        reported_duty = 0;
+        app->speed_sd_accum = 0.0f;
         movement_expected = false;
       }
       motor_hw_set(applied_duty, cur_forward);
     } else {
       applied_duty = cur_manual_duty;
+      reported_duty = applied_duty;
       motor_hw_set(applied_duty, cur_forward);
       movement_expected = false;
     }
@@ -674,7 +735,12 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
       if (cur_target_rpm <= 0.0f) {
         setpoint_reached = true;
       } else {
-        float rpm_per_count = 60.0f / (counts_per_revolution * sample_time);
+        float safety_window_time =
+            (float)SPEED_MEAS_WINDOW_TICKS * sample_time;
+        float rpm_per_count =
+            (counts_per_revolution > 0.0f && safety_window_time > 0.0f)
+                ? (60.0f / (counts_per_revolution * safety_window_time))
+                : 0.0f;
         float speed_tol = fmaxf(1.5f * rpm_per_count,
                                 SAFETY_SPEED_TOL_RATIO * cur_target_rpm);
         setpoint_reached =
@@ -716,6 +782,7 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
       };
       motor_control_handle_event(app, &revs_fault_event);
       applied_duty = 0;
+      reported_duty = 0;
       movement_expected = false;
       *movement_start_ms = 0;
       *no_motion_ms = 0;
@@ -736,7 +803,7 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
 
   taskENTER_CRITICAL(&app->config_state_lock);
   app->live_measured_rpm = measured_rpm;
-  app->live_applied_duty = applied_duty;
+  app->live_applied_duty = reported_duty;
   log_state = app->motor_state;
   log_clock_mode = app->clock_mode;
   log_position_mode = app->position_mode;
@@ -757,7 +824,7 @@ void motor_control_step(app_context_t *app, int counts, float sample_time,
                 .state = log_state,
                 .clock_mode = log_clock_mode,
                 .position_mode = log_position_mode,
-                .duty = applied_duty,
+                .duty = reported_duty,
                 .reference =
                     (log_position_mode || log_clock_mode)
                         ? log_target_pos * 360.0f / counts_per_revolution

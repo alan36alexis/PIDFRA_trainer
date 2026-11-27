@@ -105,9 +105,9 @@ La relación de cuadratura x4 cuenta ambos flancos de A y B, por lo que la resol
 Los PID por defecto están definidos mediante macros en [`src/main.c`](src/main.c) y se cargan al iniciar el firmware (o desde NVS si ya existe una configuración guardada válida):
 
 ```c
-#define DEFAULT_SPEED_KP 0.1200f
-#define DEFAULT_SPEED_KI 0.1000f
-#define DEFAULT_SPEED_KD 0.0020f
+#define DEFAULT_SPEED_KP 0.2500f
+#define DEFAULT_SPEED_KI 0.3500f
+#define DEFAULT_SPEED_KD 0.0050f
 
 #define DEFAULT_POS_KP 0.4000f
 #define DEFAULT_POS_KI 0.2000f
@@ -194,7 +194,7 @@ La lectura de los 4 potenciómetros lineales (0–3,3 V) se ejecuta en una tarea
 #define POT_SPEED_KP_MIN 0.00f
 #define POT_SPEED_KP_MAX 1.00f
 #define POT_SPEED_KI_MIN 0.00f
-#define POT_SPEED_KI_MAX 0.50f
+#define POT_SPEED_KI_MAX 1.00f
 #define POT_SPEED_KD_MIN 0.000f
 #define POT_SPEED_KD_MAX 0.050f
 #define POT_SPEED_SP_MIN 0.0f
@@ -545,15 +545,18 @@ python3 scripts/plot_needle_position.py --port /dev/ttyUSB0 --rate 20
 
 Funciones integradas en la ventana:
 
+- **Botón `STOP` (en rojo)**: detiene inmediatamente el motor enviando `STOP`.
+- **Botón `Save Plot`**: exporta el último minuto de datos de la gráfica X-Y a un archivo CSV cuyo nombre refleja el rango horario guardado (`YYYY-MM-DD_HH-MM-SS_a_HH-MM-SS.csv`), con columnas `timestamp_iso,elapsed_s,counts,degrees,degrees_mod_360,degrees_sine,seconds_scale`.
 - **`Terminal Serie`**: abre una ventana de terminal serie para enviar comandos crudos al CLI del ESP32 (`HELP`, `STATUS`, `PID GET`, `POT GET`, `NVS GET`, `CAL READ`, `LCD STATUS` o texto libre con historial ↑/↓) y ver las respuestas en tiempo real (con opción para incluir o filtrar las tramas `P,<counts>,<degrees>`).
 - **`Config PID / Modos`**: despliega un panel para cambiar de modo (`SPEED`, `POS`, `CLOCK`, `OPEN`), habilitar/deshabilitar potenciómetros (`POT ON/OFF`), enviar consignas (`ANG`, `POS`, `SPEED`, `DUTY`), leer (`PID GET`) y aplicar ganancias `KP`/`KI`/`KD` por perfil, restaurar `PID DEFAULT`, ajustar `MINMOVE` y guardar en NVS (`SAVE`).
-- **`Gráfica X-Y >>`**: despliega hacia la derecha una gráfica cartesiana en tiempo real (`Tiempo [s]` en el eje X vs `Counts` de encoder o `Grados` en el eje Y) con ventana temporal configurable (`5s`, `15s`, `30s`, `60s`), selector de escala Y (`Counts (encoder)`, `Grados Senoidal (180°·sin θ)` para trazar ondas senoidales continuas al girar, `Grados (0°..360°)`, `Grados (-180°..+180°)` y `Grados (acumulados)`), línea de referencia objetivo y botón `Limpiar X-Y`.
+- **`Gráfica X-Y >>`**: despliega hacia la derecha una gráfica cartesiana interactiva en tiempo real (`Tiempo [s]` en el eje X vs `Counts` de encoder o `Grados` en el eje Y) con ventana temporal configurable (`5s`, `15s`, `30s`, `60s`), selector de escala Y (`Counts (encoder)`, `Grados Senoidal (180°·sin θ)` para trazar ondas senoidales continuas al girar, `Grados (0°..360°)`, `Grados (-180°..+180°)` y `Grados (acumulados)`), controles `⏸ Pausar`/`▶ En Vivo`, **pan arrastrando con botón izquierdo** sobre el historial, **zoom** con la rueda del ratón (`Rueda`=eje X, `Shift+Rueda`=eje Y, `Ctrl+Rueda`=XY, o botones `Zoom +`/`Zoom -`/`Reset Vista`), **cursores de medición `C1`/`C2`** (clic derecho para colocar, arrastrar para mover, checkbox `Snap Curva` y lectura de $\Delta t$, frecuencia y $\Delta Y$), línea de referencia objetivo y botón `Limpiar X-Y`.
 
 Opciones útiles:
 
 - `--demo`: ejecuta una simulación local sin necesidad de conectar el ESP32.
 - `--xy-window <seg>`: ventana inicial de la gráfica X-Y en segundos (por defecto `15`).
 - `--xy-y-mode <counts|sine|deg360|deg180|accum>`: escala Y inicial de la gráfica X-Y (`sine` grafica $180^\circ \cdot \sin\theta$).
+- `--export-dir <ruta>`: carpeta de salida donde `Save Plot` guarda los CSV (por defecto `.`).
 - `--backend <auto|wx|gtk|matplotlib>`: usa `wxPython + Cairo` por defecto en `auto` (incluido en el entorno), o permite elegir `gtk` (GTK3 + Cairo/Pixbuf) o `matplotlib` en proyección polar.
 - `--no-init`: evita enviar automáticamente `LOG POSOUT OFF`, `LOG RATE <ms>` y `LOG POS ON` al abrir el puerto.
 - `--help`: muestra todas las opciones disponibles.

@@ -16,6 +16,7 @@
 #define ENCODER_GLITCH_FILTER_NS 1000U
 #define QUADRATURE_FACTOR 4
 #define CONTROL_PERIOD_MS 10
+#define SPEED_MEAS_WINDOW_TICKS 20U
 #define MAX_RPM 10000.0f
 #define MAX_POSITION_COUNTS 100000000.0f
 #define MAX_ANGLE_DEGREES 10000000.0f
@@ -93,7 +94,7 @@
 #define POT_SPEED_KP_MIN 0.00f
 #define POT_SPEED_KP_MAX 1.00f
 #define POT_SPEED_KI_MIN 0.00f
-#define POT_SPEED_KI_MAX 0.50f
+#define POT_SPEED_KI_MAX 1.00f
 #define POT_SPEED_KD_MIN 0.000f
 #define POT_SPEED_KD_MAX 0.050f
 #define POT_SPEED_SP_MIN 0.0f
@@ -130,9 +131,9 @@
   ((min_val) + (norm) * ((max_val) - (min_val)))
 
 /* --- Constantes PID por defecto --- */
-#define DEFAULT_SPEED_KP 0.1200f
-#define DEFAULT_SPEED_KI 0.1000f
-#define DEFAULT_SPEED_KD 0.0020f
+#define DEFAULT_SPEED_KP 0.2500f
+#define DEFAULT_SPEED_KI 0.3500f
+#define DEFAULT_SPEED_KD 0.0050f
 
 #define DEFAULT_POS_KP 0.4000f
 #define DEFAULT_POS_KI 0.2000f
@@ -146,7 +147,7 @@
 #define NVS_NAMESPACE "pidfra_cfg"
 #define NVS_BLOB_KEY "sys_cfg"
 #define NVS_CONFIG_MAGIC 0x50494446UL /* "PIDF" */
-#define NVS_CONFIG_VERSION 4U
+#define NVS_CONFIG_VERSION 5U
 #define NVS_TASK_STACK_SIZE 4096
 #define NVS_TASK_PRIORITY 3
 #define NVS_QUEUE_LENGTH 8
