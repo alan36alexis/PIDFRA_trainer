@@ -561,6 +561,23 @@ Opciones útiles:
 - `--no-init`: evita enviar automáticamente `LOG POSOUT OFF`, `LOG RATE <ms>` y `LOG POS ON` al abrir el puerto.
 - `--help`: muestra todas las opciones disponibles.
 
+## Simulación del sistema en GNU Octave (`octave/`)
+
+El directorio [`octave/`](octave/) incluye una simulación híbrida completa del sistema (planta electromecánica continua con fricción estática/Coulomb + retenedor ZOH + cuantización PCNT de `3600 cuentas/vuelta` + réplica exacta del PID discreto, filtro ADC/EMA, máquina de estados FSM y protecciones `STALL` / `1,5 vueltas`, además de análisis lineal en el plano $\mathcal{Z}$ sin dependencias externas):
+
+```bash
+# Ejecutar todos los escenarios, reporte de métricas y exportar gráficas PNG en octave/output/
+octave --no-gui octave/sim_pidfra.m
+
+# Ejecutar la suite de pruebas automatizadas
+octave --no-gui octave/test_sim_pidfra.m
+
+# Abrir consola interactiva estilo CLI serie del ESP32 con visualización inmediata
+octave octave/sim_pidfra.m --no-plots --interactive
+```
+
+Consulta [`octave/README.md`](octave/README.md) para el detalle de cada módulo y de las 6 figuras diagnósticas generadas.
+
 ## Técnica recomendada para sintonizar el sistema
 
 La estrategia práctica para determinar las constantes es:
