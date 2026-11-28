@@ -16,6 +16,7 @@
 8. [Filtrado Digital de Señales: Dentro vs. Fuera del Lazo](#8-filtrado-digital-de-señales-dentro-vs-fuera-del-lazo)
 9. [Análisis Transitorio, Sintonización Racional y Diagnóstico de Patologías](#9-análisis-transitorio-sintonización-racional-y-diagnóstico-de-patologías)
 10. [Formulario de Referencia Rápida](#10-formulario-de-referencia-rápida)
+11. [Anexo: Mapa de Correspondencia con el Firmware de PIDFRA\_trainer](#11-anexo-mapa-de-correspondencia-con-el-firmware-de-pidfra_trainer)
 
 ---
 
@@ -614,3 +615,94 @@ La teoría lineal asume que los lazos del diagrama en bloques nunca se rompen f�
 | **Resolución angular en cuadratura $\times 4$** | $q_\theta = \dfrac{360^\circ}{4 \cdot N_{\text{PPR}}}$ |
 | **Cuanto mínimo de velocidad (Método $M$)** | $\Delta \omega_{\min} = \dfrac{60}{N_c \cdot T_s}\;[\text{RPM}]$ |
 | **Filtro pasa-bajos exponencial (EMA)** | $y_f[k] = (1 - \alpha) y_f[k-1] + \alpha x[k] \iff H(z) = \dfrac{\alpha z}{z - (1 - \alpha)}, \quad \tau_f = -\dfrac{T_f}{\ln(1 - \alpha)}$ |
+
+---
+
+## 11. Anexo: Mapa de Correspondencia con el Firmware de PIDFRA\_trainer
+
+Aunque las secciones anteriores abordan la teoría de control de forma independiente del software, este anexo conecta cada concepto teórico con su materialización concreta en el firmware del entrenador (`PIDFRA_trainer`), indicando dónde se ejecuta el lazo discreto, cómo se administran sus variables y dónde reside la ecuación en diferencias del PID con *anti-windup*.
+
+### 11.1 Ejecución del lazo discreto (`control_task`) y separación de tareas
+
+El $100\%$ del lazo cerrado periódico ($T_s = 10\text{ ms}$, $f_s = 100\text{ Hz}$) se ejecuta exclusivamente dentro de la tarea `control_task` en [`src/main.c`](src/main.c) (líneas 90–121), configurada con la **máxima prioridad del sistema** (`CONTROL_TASK_PRIORITY = 6`) y temporización determinista mediante `vTaskDelayUntil` para acotar el *jitter* de muestreo:
+
+1. **Procesamiento de eventos y máquina de estados (FSM):** Consume sin bloqueo la cola `motor_event_queue` y ejecuta `motor_control_handle_event()` en [`lib/motor_control/motor_control.c`](lib/motor_control/motor_control.c) (líneas 337–593) para aplicar cambios de modo, consignas y ganancias provenientes de potenciómetros o interfaz serie.
+2. **Muestreo discreto del sensor:** Lee y reinicia el contador por hardware PCNT en cada período $T_s$ mediante `motor_hw_encoder_get_and_clear()` ([`src/main.c`](src/main.c), línea 114), obteniendo el incremento discreto $\Delta c[k]$.
+3. **Paso completo de control discreto (`motor_control_step`):** En [`lib/motor_control/motor_control.c`](lib/motor_control/motor_control.c) (líneas 595–884) se ejecutan secuencialmente:
+   - Integración discreta de posición (`encoder_position_counts += counts`) y estimación de velocidad sobre una ventana móvil de `SPEED_MEAS_WINDOW_TICKS = 20` muestras ($200\text{ ms}$).
+   - Generación de la referencia escalonada cada $1000\text{ ms}$ en modo `CLOCK`.
+   - Evaluación de la ecuación en diferencias del PID con *anti-windup* (`motor_pid_update()`).
+   - Precompensación no lineal de zona muerta (`min_move_duty`), banda de tolerancia en destino (`POSITION_TOLERANCE_COUNTS`), modulador $\Sigma\Delta$ para bajas velocidades (`speed_sd_accum`) y escritura al actuador PWM (`motor_hw_set()` / `motor_hw_stop()`).
+   - Supervisores de seguridad en tiempo discreto: filtro EMA de velocidad (`safety_filtered_rpm`), límite de recorrido sin asentamiento ($1{,}5$ vueltas) y detección de bloqueo (*stall*).
+
+**Elementos ligados al control que operan fuera de `control_task`:**
+- **Pre-filtrado digital de consignas y ganancias analógicas (fuera del lazo):** `potentiometer_task` ([`src/main.c`](src/main.c), líneas 123–242, período $50\text{ ms}$) realiza el sobremuestreo ADC ($M = 8$), el filtro digital EMA-IIR (`POT_EMA_ALPHA = 0.25`) y la banda muerta, sin modificar el PID directamente: publica eventos en `motor_event_queue` para que los consuma `control_task`.
+- **Comando `PULSE` en lazo abierto:** Al recibirse `PULSE` por UART, `serial_task` invoca `motor_control_run_pulse()` ([`lib/motor_control/motor_control.c`](lib/motor_control/motor_control.c), líneas 886–922). Mediante las banderas de coordinación `pulse_active` y `pulse_ack` ([`src/main.c`](src/main.c), líneas 107–112), `control_task` entra temporalmente en *bypass* mientras `serial_task` controla directamente el PWM y el encoder durante el pulso.
+- **Integración de flancos en cuadratura ($\times 4$):** Entre dos muestras de $10\text{ ms}$, los pulsos de las fases A y B son contabilizados autónomamente por el periférico **PCNT** por hardware.
+
+### 11.2 Ubicación y manejo concurrente de las variables críticas (`g_app`)
+
+- En la **pila local** de `control_task` ([`src/main.c`](src/main.c), líneas 91–97) residen únicamente temporizadores auxiliares (`sample_time`, `last_wake_time`, `movement_start_ms`, `no_motion_ms`, `telemetry_elapsed_ms`, `pos_log_elapsed_ms`).
+- **Todas las variables estructurales del control** viven centralizadas en el contexto global `static app_context_t g_app` ([`src/main.c`](src/main.c), línea 22; estructura definida en [`lib/motor_control/motor_control.h`](lib/motor_control/motor_control.h), líneas 20–97), sincronizado mediante la sección crítica `g_app.config_state_lock`:
+
+| Grupo de variables en `g_app` | ¿Quién las modifica? | ¿Quién más las lee? |
+|---|---|---|
+| **Estado dinámico del lazo discreto:** `motor_state`, `target_rpm`, `target_position_counts`, `encoder_position_counts`, ventana `speed_window_*`, `speed_sd_accum`, `safety_*` | **Casi exclusivamente `control_task`** (salvo `encoder_position_counts` y `forward` al finalizar `PULSE` en `serial_task`) | `display_task`, `potentiometer_task` y `serial_task` (`STATUS`, `CAL`, `LOG POS`) capturan *snapshots* de lectura |
+| **Instancias/ganancias PID y umbral:** `speed_pid`, `position_pid`, `clock_pid`, `*_pid_config` y `min_move_duty` | **Compartidas bajo `config_state_lock`:** `control_task` actualiza su estado cada $10\text{ ms}$ (y aplica potenciómetros vía cola), **pero `serial_task` y `nvs_task` también escriben directamente** | `display_task`, `serial_task` (`PID GET`) y `nvs_task` (`SAVE`) |
+
+> **Matiz clave de arquitectura:** Los comandos de cambio de modo o consigna por CLI (`MODE`, `SPEED`, `POS`, `ANG`, `DUTY`, `STOP`) se encolan en `motor_event_queue` para que los procese `control_task`. En cambio, los comandos `PID <MODO> KP/KI/KD <val>`, `PID DEFAULT` y `MINMOVE` en [`lib/serial_cli/serial_cli.c`](lib/serial_cli/serial_cli.c) (líneas 458–477 y 560–562), así como las cargas/reinicios desde memoria no volátil en `nvs_task` (`motor_control_apply_nvs_config()` en [`lib/motor_control/motor_control.c`](lib/motor_control/motor_control.c), líneas 941–957), actualizan `*_pid_config`, reinicializan `motor_pid_t` y modifican `min_move_duty` directamente desde su propio hilo protegidos por `config_state_lock`.
+
+### 11.3 Ecuación en diferencias del PID con *Anti-Windup* (`motor_pid_update`)
+
+La ley de control PID discreta con integración condicional (*clamping anti-windup*) está aislada en la función `motor_pid_update()` dentro de [`lib/motor_pid/motor_pid.c`](lib/motor_pid/motor_pid.c) (líneas 35–65), apoyada en la estructura de estado `motor_pid_t` ([`lib/motor_pid/motor_pid.h`](lib/motor_pid/motor_pid.h), líneas 14–23):
+
+```c
+float motor_pid_update(motor_pid_t *pid, float setpoint, float measurement,
+                       float sample_time_seconds)
+{
+    if (sample_time_seconds <= 0.0f) {
+        return 0.0f;
+    }
+
+    float error = setpoint - measurement;
+    float derivative = 0.0f;
+    if (pid->initialized) {
+        derivative = (error - pid->previous_error) / sample_time_seconds;
+    } else {
+        pid->initialized = 1;
+    }
+
+    float integral_candidate = pid->integral + error * sample_time_seconds;
+    float output = pid->kp * error + pid->ki * integral_candidate
+                   + pid->kd * derivative;
+
+    if (output >= pid->output_max && error > 0.0f) {
+        output = pid->output_max;
+    } else if (output <= pid->output_min && error < 0.0f) {
+        output = pid->output_min;
+    } else {
+        pid->integral = integral_candidate;
+        output = clamp(output, pid->output_min, pid->output_max);
+    }
+
+    pid->previous_error = error;
+    return output;
+}
+```
+
+#### Correspondencia línea por línea con las ecuaciones discretas
+
+| Líneas en `motor_pid.c` | Expresión matemática ($t = k T_s$) | Significado en Teoría de Control Discreto |
+|---|---|---|
+| **L42** | $e[k] = r[k] - y[k]$ | Comparador discreto de error. |
+| **L43–L48** | $D[k] = \dfrac{e[k] - e[k-1]}{T_s}$ *(con $D[0] = 0$)* | **Derivada regresiva (Backward Euler).** La bandera `initialized` anula la derivada en $k = 0$ para suprimir el *derivative kick* inicial tras un reinicio. |
+| **L50** | $\tilde{I}[k] = I[k-1] + e[k]\,T_s$ | **Integral rectangular regresiva** tentativa (*candidata*, todavía sin escribir en el estado). |
+| **L51–L52** | $v[k] = K_p e[k] + K_i \tilde{I}[k] + K_d D[k]$ | Salida lineal ideal en forma paralela/posicional antes de saturar. |
+| **L54–L61** | Si $(v[k] \ge u_{\max} \land e[k] > 0)$ o $(v[k] \le u_{\min} \land e[k] < 0) \implies I[k] = I[k-1]$; en otro caso $\implies I[k] = \tilde{I}[k]$ | **Anti-windup por integración condicional (*clamping*):** cuando la salida está saturada y el error empuja en el mismo sentido de la saturación, se descarta `integral_candidate` (se congela $I[k]$) y se acota la salida a $[u_{\min}, u_{\max}]$. |
+| **L63** | $z^{-1}\{e[k]\} \leftarrow e[k]$ | Actualización de la memoria de un paso $e[k-1]$ para el período siguiente. |
+
+#### Puntos de invocación desde `control_task`
+
+En cada período $T_s = 10\text{ ms}$, `motor_control_step()` ([`lib/motor_control/motor_control.c`](lib/motor_control/motor_control.c)) invoca `motor_pid_update()` en dos contextos distintos:
+- **Modos Posición (`FSM_POSITION`) y Reloj (`FSM_CLOCK`):** dentro de `run_position_pid_step()` (línea 184), con rango bidireccional $u \in [-255, +255]$ y error medido en cuentas acumuladas del encoder.
+- **Modo Velocidad (`FSM_SPEED`):** en las líneas 674–675, con rango unidireccional $u \in [0, +255]$ y variables expresadas en cuentas por segundo (`target_cps` frente a `measured_cps`).
